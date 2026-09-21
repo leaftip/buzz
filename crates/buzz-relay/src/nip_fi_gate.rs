@@ -201,6 +201,52 @@ impl SessionAdmissionGate {
         *phase = SessionPhase::Expired;
         // Write guard released here on drop — expiry task's await completes.
     }
+
+    /// Quiesce the session after an external cancellation.
+    ///
+    /// Called when the connection was cancelled externally (e.g., admin disconnect
+    /// via `disconnect_nip_fi`) before the session deadline.  In this path the
+    /// socket is already cancelled; this method only acquires the write guard to
+    /// wait for any in-flight effect permits to be released.
+    ///
+    /// ## Why this is needed — F5
+    ///
+    /// `spawn_nip_fi_expiry_task` uses a `tokio::select!` with two arms:
+    ///   1. `sleep(remaining)` — fires at deadline; calls `gate.expire()`, which
+    ///      performs the full quiescence barrier before the task exits.
+    ///   2. `gate.cancelled()` — fires on external cancellation; previously returned
+    ///      immediately without waiting for in-flight permits.
+    ///
+    /// When admin disconnect fires cancel and the cancellation arm wins, the
+    /// connection teardown (`remove_connection`, subscription cleanup) in
+    /// `connection.rs` awaits the expiry task — but the task returned before
+    /// any in-flight REQ handler (which holds a `SessionEffectPermit`) finished
+    /// its registration.  The handler then completed registration AFTER cleanup,
+    /// leaving orphan subscription registry entries and retained topic references.
+    ///
+    /// With `quiesce()`, the cancellation arm blocks until every outstanding
+    /// effect permit is dropped, guaranteeing that all permitted work finishes
+    /// before the task returns — and therefore before `remove_connection` runs.
+    ///
+    /// ## Ordering contract
+    ///
+    /// * Does NOT call `terminal()` — the denial frame is already enqueued by
+    ///   the `manager_disconnect_nip_fi` or `disconnect_nip_fi` path that
+    ///   cancelled the token.  A second frame would be a protocol error.
+    /// * Does NOT call `cancel.cancel()` — the token is already cancelled.
+    /// * Records `SessionPhase::Expired` so that any `acquire_effect` that races
+    ///   the write guard (after the cancel check fails) sees the correct phase.
+    ///
+    /// [F5: admin-cancel quiescence barrier]
+    pub(crate) async fn quiesce(&self) {
+        // Acquire the write guard — blocks until all outstanding read guards
+        // (live effect permits) are dropped.  This is the same quiescence barrier
+        // used by expire(), minus the terminal() and cancel.cancel() calls that
+        // have already happened.
+        let mut phase = self.phase.write().await;
+        *phase = SessionPhase::Expired;
+        // Write guard released here — expiry task's await completes.
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -360,4 +406,75 @@ mod tests {
             "cancelled gate must report expired"
         );
     }
+}
+
+// ── quiesce() blocks until all held permits drop ───────────────────────────
+//
+// Proves that `quiesce()` does not complete until all outstanding read guards
+// (live effect permits) are released.  This is the F5 quiescence barrier:
+// admin-cancel fires, expiry task's cancellation arm calls quiesce(), and the
+// task must not return (allowing `remove_connection` to run) until every
+// pre-cancel permit-holder has finished its bounded effect.
+//
+// Mutation evidence:
+//   A) Remove the write-guard acquisition from `quiesce()` (make it a no-op) →
+//      quiesce completes before the permit is dropped → `quiesce_done` is
+//      true before `drop(permit)` → "quiesce must not complete" assertion panics.
+//   B) Remove the `quiesce().await` call from the cancellation arm of
+//      `spawn_nip_fi_expiry_task` and return immediately →
+//      the task exits before the permit is released → same assertion panics
+//      at the integration level (W_f5 witness in nip_fi_session tests).
+
+#[tokio::test]
+async fn quiesce_blocks_until_held_permits_drop() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc as StdArc;
+
+    let cancel = CancellationToken::new();
+    let gate = SessionAdmissionGate::new(Utc::now() + chrono::Duration::hours(1), cancel.clone());
+
+    // Hold a permit — quiesce must block until we release it.
+    let permit = gate.acquire_effect().await.expect("permit before cancel");
+
+    // Cancel the token (simulating admin disconnect).
+    cancel.cancel();
+
+    let quiesce_done = StdArc::new(AtomicBool::new(false));
+    let quiesce_done2 = StdArc::clone(&quiesce_done);
+    let gate2 = Arc::clone(&gate);
+
+    let quiesce_task = tokio::spawn(async move {
+        gate2.quiesce().await;
+        quiesce_done2.store(true, Ordering::SeqCst);
+    });
+
+    // Yield to let quiesce_task start — it should be blocked on the write guard.
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        !quiesce_done.load(Ordering::SeqCst),
+        "quiesce must not complete while a permit is still held"
+    );
+
+    // Drop the permit — quiesce_task can now acquire the write guard.
+    drop(permit);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), quiesce_task)
+        .await
+        .expect("quiesce must complete within timeout after permit drop")
+        .expect("quiesce task must not panic");
+
+    assert!(
+        quiesce_done.load(Ordering::SeqCst),
+        "quiesce must complete after permit is released"
+    );
+
+    // After quiesce, acquire_effect must fail (phase is Expired).
+    let post_quiesce = gate.acquire_effect().await;
+    assert!(
+        matches!(post_quiesce, Err(SessionExpired)),
+        "acquire_effect must fail after quiesce() (phase = Expired)"
+    );
 }

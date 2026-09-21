@@ -280,3 +280,21 @@ pub(crate) mod event_publish_counter {
 pub(crate) fn before_event_publish(community: CommunityId) {
     event_publish_counter::increment(community);
 }
+
+// ── Observer-permit hook ───────────────────────────────────────────────────
+// `before_observer_publication`: fires immediately before `acquire_effect` in
+// `handle_agent_observer_event`, after all validation and owner checks.
+// Used by the F1 witness: after expiry is armed and the handler reaches this
+// hook, fire cancel so `acquire_effect` returns `SessionExpired` and the
+// observer frame is NOT published.
+//
+// Mutation evidence (F1 witness):
+//   A) Delete `#[cfg(test)] before_observer_publication(...)` call →
+//      `arrived_rx` times out → test panics.
+//   B) Remove `acquire_effect` from the observer handler →
+//      handler calls publish_event even when expired → OK(true) sent →
+//      assertion on the cancel-before-acquisition invariant panics.
+//   C) Move hook to after `mark_local_event` (past the permit) →
+//      hook fires after the irreversible side effect; expired gate
+//      can no longer prevent delivery → publication counter shows 1 → panics.
+make_hook!(observer_publication_hook, before_observer_publication);

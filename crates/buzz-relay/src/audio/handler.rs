@@ -919,6 +919,18 @@ pub(crate) async fn handle_active_audio_connection(
             Ok(p) => p,
             Err(crate::nip_fi_gate::SessionExpired) => {
                 // Expiry fired before we could add the peer. No peer, no commit.
+                // F4: Publish the serialized deadline cause BEFORE self-cancelling.
+                // The expiry task's unbiased select may take the cancellation arm
+                // (fired by the already-elapsed wall-clock path) and skip
+                // `expiry_deny_terminal`.  Calling it here wins the reason slot
+                // (or defers to a prior winner) and enqueues the denial frame, so
+                // the consumer always drains a denial frame before the Close.
+                // respecting an already-winning cause (first-writer-wins).
+                // [F4: audio deadline rejection — denial precedes self-cancel]
+                control.expiry_deny_terminal(
+                    &terminal_ctrl_tx,
+                    crate::nip_fi_session::NipFiWsRoute::Audio,
+                );
                 // IMPORTANT 3 residual: await expiry task explicitly.
                 cancel.cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
@@ -1165,6 +1177,7 @@ pub(crate) async fn handle_active_audio_connection(
         &pubkey_bytes,
         peer_id,
         lifecycle_revision,
+        &lifecycle_generation,
         &membership_admission,
         &audio_gate,
         joined_msg,
@@ -1220,6 +1233,17 @@ pub(crate) async fn handle_active_audio_connection(
         Err(JoinCommitError::Expired) => {
             // Gate denied — expiry fired before commit. No `joined` frame was
             // sent — commit-won invariant holds.
+            //
+            // F4: Publish the serialized deadline cause BEFORE self-cancelling.
+            // The expiry task's unbiased select may take the cancellation arm
+            // (wall-clock deadline already elapsed) and return without calling
+            // `expiry_deny_terminal`.  Calling it here wins the reason slot
+            // (or defers to a prior winner), ensuring the denial frame is queued
+            // before cancel fires.  [F4: audio commit rejection]
+            control.expiry_deny_terminal(
+                &terminal_ctrl_tx,
+                crate::nip_fi_session::NipFiWsRoute::Audio,
+            );
             //
             // IMPORTANT 3 residual: `acquire_effect()` can return `SessionExpired`
             // via the deadline fast path (Utc::now() >= deadline) before the
@@ -2251,16 +2275,23 @@ async fn commit_participant_join(
     pubkey_bytes: &[u8],
     peer_id: Uuid,
     roster_revision: u64,
+    lifecycle_generation: &str,
     membership_admission: &MembershipAdmission,
     gate: &std::sync::Arc<crate::nip_fi_gate::SessionAdmissionGate>,
     joined_msg: String,
     room: &std::sync::Arc<crate::audio::room::Room>,
 ) -> Result<CommitJoinOutcome, JoinCommitError> {
     // 1. Sign the 48101 event synchronously.
+    // Include lifecycle_generation so Desktop reconciliation can compare against
+    // liveness responses — without it, an already-hydrated observer sees a JOIN
+    // without a generation, treats it as "pending", and then clears admissions
+    // when the next authoritative liveness response (with a real generation)
+    // differs.  [F3: lifecycle_generation in 48101 JOIN]
     let content = serde_json::json!({
         "ephemeral_channel_id": channel_id.to_string(),
         "roster_revision": roster_revision,
         "admission_id": peer_id.to_string(),
+        "lifecycle_generation": lifecycle_generation,
     })
     .to_string();
 
@@ -5036,10 +5067,11 @@ mod tests {
         if sqlx::PgPool::connect(db_url).await.is_err() {
             return None;
         }
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // hermetic_for_test: env-free, never races NIP-FI env-var mutations.
+        // Override database_url to the live local DB probed above. [F6]
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
         config.database_url = db_url.to_string();
-        config.redis_url = "redis://127.0.0.1:1".to_string();
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
         let db = buzz_db::Db::from_pool(pool.clone());
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
@@ -5184,6 +5216,7 @@ mod tests {
                 &member_bytes2,
                 peer_id,
                 roster_revision,
+                "test-generation",
                 &membership,
                 &gate2,
                 String::new(),
@@ -5253,6 +5286,100 @@ mod tests {
         );
     }
 
+    // ── F3: lifecycle_generation in committed 48101 JOIN ──────────────────────
+    //
+    // Verifies that `commit_participant_join` includes `lifecycle_generation` in
+    // the 48101 event content for both Enforce mode (with a real generation
+    // string) and Off mode (using the relay's global liveness generation).
+    //
+    // Without this field Desktop reconciliation assigns "pending" to the joining
+    // peer and then clears admissions when the next authoritative liveness
+    // response (which includes the real generation) differs from the JOIN's
+    // absent generation.
+    //
+    // Mutation evidence:
+    //   Remove `"lifecycle_generation": lifecycle_generation` from the content
+    //   JSON in `commit_participant_join` → the field is absent → the assertion
+    //   on `content_json["lifecycle_generation"]` panics.
+    #[tokio::test]
+    async fn f3_commit_participant_join_includes_lifecycle_generation() {
+        use uuid::Uuid;
+
+        let state = match audio_test_state_real_db().await {
+            Some(s) => s,
+            None => {
+                eprintln!("F3: skipping — local DB not available at postgres://buzz:buzz_dev@127.0.0.1:5432/buzz");
+                return;
+            }
+        };
+        let pool = state.db.pool().clone();
+        let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
+        let community_id = tenant.community();
+        let pubkey_hex = member_key.public_key().to_hex();
+        let pubkey_bytes = member_key.public_key().to_bytes().to_vec();
+
+        let generation_string = "test-lifecycle-gen-f3";
+
+        // Off-mode gate (no deadline → acquire_effect always succeeds).
+        let off_cancel = tokio_util::sync::CancellationToken::new();
+        let off_gate = crate::nip_fi_gate::SessionAdmissionGate::off_mode(off_cancel.clone());
+
+        let result = commit_participant_join(
+            &state,
+            &tenant,
+            channel_id,
+            channel_id,
+            &pubkey_hex,
+            &pubkey_bytes,
+            Uuid::new_v4(),
+            1,
+            generation_string,
+            &MembershipAdmission::Existing {
+                parent_channel_id: channel_id,
+            },
+            &off_gate,
+            String::new(),
+            &std::sync::Arc::new(crate::audio::room::Room::new(community_id, channel_id)),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "F3: commit_participant_join must succeed; got: {result:?}"
+        );
+
+        // Retrieve the committed 48101 row and check its content.
+        let content_str: String = sqlx::query_scalar(
+            "SELECT content::text FROM events \
+             WHERE community_id = $1 AND channel_id = $2 AND kind = 48101 \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .expect("F3: 48101 row must exist after commit");
+
+        let content_json: serde_json::Value =
+            serde_json::from_str(&content_str).expect("F3: 48101 content must be valid JSON");
+
+        assert_eq!(
+            content_json["lifecycle_generation"].as_str(),
+            Some(generation_string),
+            "F3: 48101 JOIN content must include lifecycle_generation = {generation_string:?}; \
+             got content: {content_str}"
+        );
+
+        assert!(
+            content_json["roster_revision"].as_u64().is_some(),
+            "F3: 48101 JOIN content must include roster_revision"
+        );
+        assert!(
+            content_json["admission_id"].as_str().is_some(),
+            "F3: 48101 JOIN content must include admission_id"
+        );
+    }
+
     // ── W10: two concurrent committers; expiry during second; first row intact ──
     //
     // Two concurrent tasks call `commit_participant_join` for different pubkeys.
@@ -5317,6 +5444,7 @@ mod tests {
                 &member_bytes_a,
                 Uuid::new_v4(),
                 1,
+                "test-generation-a",
                 &MembershipAdmission::Existing {
                     parent_channel_id: channel_id,
                 },
@@ -5358,6 +5486,7 @@ mod tests {
                 &member_bytes_b,
                 Uuid::new_v4(),
                 2,
+                "test-generation-b",
                 &MembershipAdmission::Existing {
                     parent_channel_id: channel_id,
                 },
@@ -5465,6 +5594,7 @@ mod tests {
                 &bytes1,
                 Uuid::new_v4(),
                 1,
+                "test-generation",
                 &MembershipAdmission::Existing {
                     parent_channel_id: channel_id,
                 },
@@ -5506,6 +5636,7 @@ mod tests {
                 &bytes2,
                 Uuid::new_v4(),
                 2,
+                "test-generation",
                 &MembershipAdmission::Existing {
                     parent_channel_id: channel_id,
                 },
@@ -5741,6 +5872,7 @@ mod tests {
                 &joiner_bytes2,
                 Uuid::new_v4(),
                 1,
+                "test-generation",
                 &membership,
                 &gate2,
                 String::new(),
@@ -5934,6 +6066,7 @@ mod tests {
                 &joiner_bytes2,
                 Uuid::new_v4(),
                 1,
+                "test-generation",
                 &membership,
                 &gate2,
                 String::new(),
@@ -6495,6 +6628,7 @@ mod tests {
                 &bytes2,
                 peer_id,
                 1,
+                "test-generation",
                 &membership,
                 &gate2,
                 String::new(),

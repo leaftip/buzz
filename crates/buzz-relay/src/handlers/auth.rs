@@ -465,10 +465,10 @@ mod tests {
 
     async fn auth_test_state() -> std::sync::Arc<crate::state::AppState> {
         use std::sync::Arc;
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // hermetic_for_test: env-free, uses port-1 sockets — never races NIP-FI
+        // env-var mutations from nip_fi_config tests. [F6: ambient NIP-FI fixture race]
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
-        config.database_url = "postgres://buzz:buzz_dev@127.0.0.1:1/buzz".to_string();
-        config.redis_url = "redis://127.0.0.1:1".to_string();
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
         let db = buzz_db::Db::from_pool(pool.clone());
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
@@ -517,10 +517,11 @@ mod tests {
         if sqlx::PgPool::connect(db_url).await.is_err() {
             return None;
         }
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // hermetic_for_test: env-free, never races NIP-FI env-var mutations.
+        // Override database_url to the live local DB probed above. [F6]
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
         config.database_url = db_url.to_string();
-        config.redis_url = "redis://127.0.0.1:1".to_string();
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
         let db = buzz_db::Db::from_pool(pool.clone());
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)

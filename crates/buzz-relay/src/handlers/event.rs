@@ -1113,6 +1113,34 @@ async fn handle_agent_observer_event(
         }
     }
 
+    // B2: acquire effect permit immediately before the irreversible side effects
+    // (mark_local_event + Redis publish + local fan-out).  Holds through fan-out
+    // so expiry cannot cancel the connection mid-publication.
+    //
+    // Schedule without this permit: validation and owner lookup complete, the
+    // session expires (admin disconnect), the already-spawned task resumes and
+    // publishes to a live agent — recipient access checks do not validate
+    // publisher authority.  The permit fences this resumed-task scenario:
+    // if the gate is expired, SessionExpired is returned and publication is
+    // skipped.  [FI-TRACE-LEASE-BOUND, F1: observer permit]
+    //
+    // Test hook: fires immediately before acquire_effect so a test can arm expiry
+    // in the async gap between owner-validation and permit acquisition.
+    // [nip_fi_test_hooks::observer_publication_hook]
+    #[cfg(test)]
+    crate::nip_fi_test_hooks::before_observer_publication(conn.tenant.community()).await;
+    let _observer_permit = match conn.nip_fi_gate.acquire_effect().await {
+        Ok(permit) => permit,
+        Err(crate::nip_fi_gate::SessionExpired) => {
+            conn.send(RelayMessage::ok(
+                event_id_hex,
+                false,
+                "restricted: session expired",
+            ));
+            return;
+        }
+    };
+
     state.mark_local_event(conn.tenant.community(), &event.id);
     if let Err(e) = state
         .pubsub
@@ -2057,9 +2085,10 @@ mod tests {
         use crate::state::AppState;
 
         pub(super) fn test_config() -> crate::config::Config {
-            let mut config = crate::config::Config::from_env().expect("default config loads");
+            // hermetic_for_test: env-free — never races NIP-FI env-var mutations
+            // from concurrent nip_fi_config tests. [F6: ambient NIP-FI fixture race]
+            let mut config = crate::config::Config::hermetic_for_test();
             config.require_relay_membership = false;
-            config.redis_url = "redis://127.0.0.1:1".to_string();
             config
         }
 
@@ -2756,5 +2785,155 @@ mod tests {
                  found {row_count} row(s)"
             );
         }
+    }
+
+    // ── W_observer_permit: F1 — cancel before permit acquisition blocks publication
+    //
+    // Arms `before_observer_publication` so the test can fire expiry while the
+    // observer handler is between owner-validation and `acquire_effect`.  After
+    // release, `acquire_effect` returns `SessionExpired` and the handler sends
+    // OK(false, "restricted: session expired") without calling `mark_local_event`
+    // or `publish_event`.
+    //
+    // Setup: two distinct key pairs (owner and agent).  The owner sends a Control
+    // frame to the agent.  The connection authenticates as the owner via NIP-42,
+    // with `agent_owner_pubkey` set so `session_owner_match` short-circuits the
+    // DB lookup.  The content is NIP-44 encrypted using `encrypt_observer_payload`.
+    //
+    // Mutation evidence:
+    //   A) Delete the `#[cfg(test)] before_observer_publication(...)` call →
+    //      `arrived_rx` times out → test panics.
+    //   B) Remove `acquire_effect` from `handle_agent_observer_event` →
+    //      handler publishes even when cancelled → sends OK(true) → panics.
+    //   C) Change gate to `off_mode` → `acquire_effect` always succeeds after
+    //      cancel → publishes → OK(true) → panics.
+    #[tokio::test]
+    async fn w_observer_permit_cancel_before_acquisition_blocks_publication() {
+        use buzz_core::observer::{
+            encrypt_observer_payload, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL,
+            OBSERVER_FRAME_TAG,
+        };
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        use std::sync::Arc;
+        use tokio::sync::{mpsc, RwLock};
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        // Two distinct keys: the owner sends a Control frame to the agent.
+        let owner_keys = Keys::generate();
+        let agent_keys = Keys::generate();
+        let owner_pubkey = owner_keys.public_key();
+        let agent_pubkey = agent_keys.public_key();
+
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let cancel = CancellationToken::new();
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::from_u128(0xf1f1));
+
+        let (send_tx, mut send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(1);
+        let subscriptions = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        // Connection is authenticated as the owner.  `agent_owner_pubkey` is set
+        // to the owner's own pubkey so `session_owner_match` returns true and the
+        // DB lookup (is_agent_owner) is skipped.
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string()),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
+                buzz_auth::AuthContext {
+                    pubkey: owner_pubkey,
+                    scopes: vec![],
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    // session_owner_match: ctx.agent_owner_pubkey == Some(route.owner)
+                    // where route.owner == event.pubkey == owner_pubkey.
+                    agent_owner_pubkey: Some(owner_pubkey),
+                },
+            )),
+            subscriptions: Arc::clone(&subscriptions),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: Some(deadline),
+            nip_fi_gate: gate,
+            community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
+        });
+
+        let state = crate::state::tests::test_state().await;
+        let conn_id = conn.conn_id;
+
+        // Build a valid Control frame: owner → agent.
+        // NIP-44 encrypted so content_looks_like_nip44() passes.
+        let encrypted = encrypt_observer_payload(
+            &owner_keys,
+            &agent_pubkey,
+            &serde_json::json!({"type": "cancel_turn"}),
+        )
+        .expect("W_observer_permit: encrypt observer payload");
+        let event = EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), encrypted)
+            .tags([
+                Tag::parse(["p", &agent_pubkey.to_hex()]).expect("p tag"),
+                Tag::parse([OBSERVER_AGENT_TAG, &agent_pubkey.to_hex()]).expect("agent tag"),
+                Tag::parse([OBSERVER_FRAME_TAG, OBSERVER_FRAME_CONTROL]).expect("frame tag"),
+            ])
+            .sign_with_keys(&owner_keys)
+            .expect("W_observer_permit: sign observer event");
+        let event_id_hex_str = event.id.to_hex();
+
+        // Arm the barrier.
+        let (arrived_rx, release) =
+            crate::nip_fi_test_hooks::observer_publication_hook::arm(community);
+
+        let conn2 = Arc::clone(&conn);
+        let state2 = Arc::clone(&state);
+        let event_clone = event.clone();
+        let eid_clone = event_id_hex_str.clone();
+        let handle = tokio::spawn(async move {
+            super::handle_agent_observer_event(event_clone, conn_id, &eid_clone, conn2, state2)
+                .await
+        });
+
+        // Wait for the handler to reach the permit boundary.
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("W_observer_permit: handler must reach before_observer_publication within 5s")
+            .expect("arrived channel closed");
+
+        // Fire expiry and release the barrier.
+        cancel.cancel();
+        release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("W_observer_permit: handler must return within 5s")
+            .expect("handle_agent_observer_event must not panic");
+
+        // Handler must send OK(false, "restricted: session expired").
+        let resp = send_rx
+            .try_recv()
+            .expect("W_observer_permit: handler must send a message");
+        let resp_text = match resp {
+            axum::extract::ws::Message::Text(t) => t.to_string(),
+            other => panic!("W_observer_permit: expected Text, got {other:?}"),
+        };
+        assert!(
+            resp_text.contains("false"),
+            "W_observer_permit: handler must send OK(false) when gate expired; got: {resp_text}"
+        );
+        assert!(
+            resp_text.contains("session expired"),
+            "W_observer_permit: handler must include 'session expired'; got: {resp_text}"
+        );
+        assert!(
+            send_rx.try_recv().is_err(),
+            "W_observer_permit: exactly one message expected"
+        );
     }
 }

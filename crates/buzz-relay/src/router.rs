@@ -765,9 +765,9 @@ mod tests {
     /// Relay state serving both bundles: the admin SPA on `admin.example` and
     /// the public SPA on any other host.
     async fn spa_state(admin_dir: &std::path::Path, web_dir: &std::path::Path) -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // hermetic_for_test: env-free — never races NIP-FI env-var mutations. [F6]
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
-        config.redis_url = "redis://127.0.0.1:1".to_string();
         config.web_dir = Some(web_dir.to_path_buf());
         config.admin = Some(crate::config::AdminConfig {
             host: "admin.example".to_string(),
@@ -808,10 +808,9 @@ mod tests {
     }
 
     async fn readiness_state(evaluator: Arc<dyn readiness::ReadinessEvaluator>) -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // hermetic_for_test: env-free — never races NIP-FI env-var mutations. [F6]
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
-        config.database_url = "postgres://buzz:buzz_dev@127.0.0.1:1/buzz".to_string();
-        config.redis_url = "redis://127.0.0.1:1".to_string();
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
         let db = buzz_db::Db::from_pool(pool.clone());
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
@@ -1512,9 +1511,9 @@ mod tests {
         // Build config directly without env mutation — the nip_fi field is
         // constructed explicitly below, so reading NIP-FI env vars is irrelevant
         // and mutating them would race the config-module tests (separate statics).
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // hermetic_for_test is env-free; nip_fi is overridden below. [F6]
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
-        config.redis_url = "redis://127.0.0.1:1".to_string();
         // Override NIP-FI mode to Enforce with no issuers configured — the
         // verifier will be None (no JWKS source), which is the startup-race
         // condition that must return 503 for a token-carrying request.
