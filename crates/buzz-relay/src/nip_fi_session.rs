@@ -104,7 +104,7 @@ pub(crate) async fn enforce_nip_fi_key_pairing(
                 proven_pubkey = %proven_pubkey.to_hex(),
                 "NIP-FI key pairing mismatch — closing connection"
             );
-            *conn.auth_state.write().await = crate::connection::AuthState::Failed;
+            conn.reject_auth(crate::metrics::AuthOutcome::PairingMismatch);
             // Use the dedicated terminal channel — guaranteed one free slot even
             // when ctrl_tx (capacity 8) is saturated by ordinary control traffic.
             let _ = conn
