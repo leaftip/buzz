@@ -1647,6 +1647,9 @@ pub(crate) mod tests {
                             tenant,
                             Uuid::new_v4(),
                             control,
+                            None,
+                            chrono::Utc::now(),
+                            None,
                         )
                         .await;
                         finished.notify_one();
@@ -1965,6 +1968,7 @@ pub(crate) mod tests {
     async fn cancelled_never_ready_sink_cannot_retain_writer_task() {
         let (data_tx, data_rx) = mpsc::channel(1);
         let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
+        let (_terminal_ctrl_tx, terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
         let (_restart_tx, restart_rx) = mpsc::channel(1);
         let cancel = CancellationToken::new();
         let ready_polled = Arc::new(Notify::new());
@@ -1979,6 +1983,7 @@ pub(crate) mod tests {
             },
             data_rx,
             ctrl_rx,
+            terminal_ctrl_rx,
             restart_rx,
             cancel.clone(),
             ordinary_disconnect_reason(),
@@ -2416,7 +2421,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn b2_cancelled_connection_event_frame_not_dispatched() {
         use std::collections::HashMap;
-        use tokio::sync::RwLock;
+        use tokio::sync::mpsc;
 
         // Pre-cancel the token — simulates the expiry task having already fired.
         let cancel = CancellationToken::new();
@@ -2433,7 +2438,7 @@ pub(crate) mod tests {
                 "test.local".to_string(),
             ),
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
-            auth_state: RwLock::new(AuthState::Failed),
+            auth_state: StdMutex::new(AuthState::Failed),
             subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             send_tx,
             ctrl_tx,

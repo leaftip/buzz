@@ -272,11 +272,16 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                         if !conn.reject_auth(AuthOutcome::AllowlistDenied) {
                             return;
                         }
-                        conn.send(RelayMessage::ok(
-                            &event_id_hex,
-                            false,
-                            "auth-required: verification failed",
-                        ));
+                        // Fix 4a: when an FI assertion is present, use the uniform
+                        // NIP-FI denial text so allowlist status is not
+                        // distinguishable from a membership or ban denial.
+                        // [FI-TRACE-DENIAL-ORACLE]
+                        let deny_text = if conn.nip_fi_assertion.is_some() {
+                            "restricted: authorization denied"
+                        } else {
+                            "auth-required: verification failed"
+                        };
+                        conn.send(RelayMessage::ok(&event_id_hex, false, deny_text));
                         return;
                     }
                     PolicyCheck::DependencyError => {
@@ -551,7 +556,13 @@ mod tests {
 
     async fn auth_test_state() -> std::sync::Arc<crate::state::AppState> {
         use std::sync::Arc;
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // Fix 5: hold NIP_FI_ENV_LOCK across Config::from_env() to prevent
+        // racing nip_fi_config tests that mutate NIP-FI env vars under the
+        // same lock. Release before any await point. [FI-TRACE-ENV-RACE]
+        let mut config = {
+            let _env_guard = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
+            crate::config::Config::from_env().expect("default config loads")
+        };
         config.require_relay_membership = false;
         config.database_url = "postgres://buzz:buzz_dev@127.0.0.1:1/buzz".to_string();
         config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -794,7 +805,11 @@ mod tests {
             let pool = sqlx::PgPool::connect(&db_url)
                 .await
                 .expect("W1: PostgreSQL must be available — set BUZZ_TEST_DATABASE_URL");
-            let mut config = crate::config::Config::from_env().expect("default config loads");
+            // Fix 5: hold NIP_FI_ENV_LOCK across Config::from_env(). [FI-TRACE-ENV-RACE]
+            let mut config = {
+                let _env_guard = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
+                crate::config::Config::from_env().expect("default config loads")
+            };
             config.require_relay_membership = false;
             config.database_url = db_url.clone();
             config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -961,6 +976,143 @@ mod tests {
                     );
                 }
             }
+        }
+
+        /// Fix 4a witness: root allowlist denial with FI assertion emits
+        /// `restricted: authorization denied` — not `auth-required: verification
+        /// failed` — so the allowlist gate is not distinguishable from other
+        /// local-policy denials when enforcement is active.
+        ///
+        /// Requires a real DB so `is_pubkey_allowed` can return `Ok(false)` for a
+        /// key not in the allowlist. The community is freshly created so the key
+        /// has never been allowlisted.
+        ///
+        /// Mutation oracle:
+        ///   A) Remove the `if conn.nip_fi_assertion.is_some()` branch in the
+        ///      allowlist denied arm → reply text is `auth-required: verification
+        ///      failed` → assertion panics.
+        ///   B) Change the FI-mode reply to any text other than `restricted:
+        ///      authorization denied` → assertion panics.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn fix_4a_allowlist_denial_with_fi_assertion_emits_canonical_restricted_frame() {
+            use buzz_auth::VerifiedAssertion;
+            use chrono::{Duration, Utc};
+            use std::collections::HashMap;
+            use std::sync::Arc;
+            use tokio::sync::mpsc;
+            use tokio_util::sync::CancellationToken;
+            use uuid::Uuid;
+
+            // Build state with pubkey allowlist enabled + real DB.
+            let db_url = crate::test_support::database_url();
+            let pool = sqlx::PgPool::connect(&db_url)
+                .await
+                .expect("Fix4a: PostgreSQL must be available");
+            // Fix 5: hold NIP_FI_ENV_LOCK across Config::from_env(). [FI-TRACE-ENV-RACE]
+            let mut config = {
+                let _env_guard = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
+                crate::config::Config::from_env().expect("default config loads")
+            };
+            config.require_relay_membership = false;
+            config.pubkey_allowlist_enabled = true;
+            config.database_url = db_url.clone();
+            config.redis_url = "redis://127.0.0.1:1".to_string();
+            let db = buzz_db::Db::from_pool(pool.clone());
+            let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .expect("redis pool");
+            let pubsub = Arc::new(
+                buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                    .await
+                    .expect("pubsub manager"),
+            );
+            let audit = buzz_audit::AuditService::new(pool.clone());
+            let auth = buzz_auth::AuthService::new(config.auth.clone());
+            let search = buzz_search::SearchService::new(pool.clone());
+            let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+                db.clone(),
+                buzz_workflow::WorkflowConfig::default(),
+            ));
+            let media_storage =
+                buzz_media::MediaStorage::new(&config.media).expect("media storage");
+            let (state, _audit_shutdown) = crate::state::AppState::new(
+                config,
+                db,
+                redis_pool,
+                audit,
+                pubsub,
+                auth,
+                search,
+                workflow_engine,
+                nostr::Keys::generate(),
+                media_storage,
+            );
+            let state = Arc::new(state);
+
+            // A matching key — pairing passes; the allowlist gate is the one that denies.
+            let key = Keys::generate();
+            let assertion = VerifiedAssertion::for_test(
+                Some(key.public_key()),
+                vec![Utc::now() + Duration::hours(1)],
+            );
+
+            let challenge = "fix-4a-allowlist-challenge".to_string();
+            let (send_tx, mut send_rx) = mpsc::channel::<WsMessage>(8);
+            let (ctrl_tx, _ctrl_rx) = mpsc::channel::<WsMessage>(8);
+            let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+            let cancel = CancellationToken::new();
+
+            let conn = Arc::new(crate::connection::ConnectionState {
+                conn_id: Uuid::new_v4(),
+                tenant: buzz_core::tenant::TenantContext::resolved(
+                    buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                    "test.local".to_string(),
+                ),
+                remote_addr: "127.0.0.1:1234".parse().unwrap(),
+                auth_state: std::sync::Mutex::new(AuthState::Pending {
+                    challenge: challenge.clone(),
+                    started_at: Instant::now(),
+                }),
+                subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                send_tx,
+                ctrl_tx,
+                terminal_ctrl_tx,
+                cancel: cancel.clone(),
+                backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                grace_limit: 3,
+                nip_fi_assertion: Some(assertion),
+                session_deadline: None,
+                nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+            });
+
+            let relay_url = "ws://test.local";
+            let auth_event = EventBuilder::new(Kind::Authentication, "")
+                .tag(Tag::parse(["relay", relay_url]).unwrap())
+                .tag(Tag::parse(["challenge", &challenge]).unwrap())
+                .sign_with_keys(&key)
+                .unwrap();
+            handle_auth(auth_event, Arc::clone(&conn), state).await;
+
+            // Must see `restricted: authorization denied` — not the non-FI text.
+            let mut found = false;
+            while let Ok(frame) = send_rx.try_recv() {
+                if let WsMessage::Text(t) = frame {
+                    if t.contains("restricted: authorization denied") {
+                        found = true;
+                    }
+                    assert!(
+                        !t.contains("auth-required: verification failed"),
+                        "Fix 4a: allowlist denial with FI assertion must NOT expose \
+                         'auth-required: verification failed'; got: {t}"
+                    );
+                }
+            }
+            assert!(
+                found,
+                "Fix 4a: allowlist denial with FI assertion must emit \
+                 'restricted: authorization denied'"
+            );
         }
     }
 

@@ -1607,9 +1607,18 @@ mod tests {
                 subscriptions: Arc::new(Mutex::new(HashMap::new())),
                 send_tx,
                 ctrl_tx,
+                terminal_ctrl_tx: {
+                    let (tx, _) = mpsc::channel(1);
+                    tx
+                },
                 cancel: CancellationToken::new(),
                 backpressure_count: Arc::new(AtomicU8::new(0)),
                 grace_limit: 3,
+                nip_fi_assertion: None,
+                session_deadline: None,
+                nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(
+                    CancellationToken::new(),
+                ),
             });
             let watcher = Uuid::new_v4();
             let (tx, mut rx) = mpsc::channel(10);
@@ -1752,9 +1761,18 @@ mod tests {
                 subscriptions: Arc::new(Mutex::new(HashMap::new())),
                 send_tx,
                 ctrl_tx,
+                terminal_ctrl_tx: {
+                    let (tx, _) = mpsc::channel(1);
+                    tx
+                },
                 cancel: CancellationToken::new(),
                 backpressure_count: Arc::new(AtomicU8::new(0)),
                 grace_limit: 3,
+                nip_fi_assertion: None,
+                session_deadline: None,
+                nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(
+                    CancellationToken::new(),
+                ),
             });
             // Same watcher registration as the ACK/fan-out cases, proving
             // the storage failure still reaches no subscriber while its
@@ -2983,7 +3001,7 @@ mod tests {
             use std::collections::HashMap;
             use std::sync::atomic::Ordering;
             use std::sync::Arc;
-            use tokio::sync::{mpsc, RwLock};
+            use tokio::sync::mpsc;
             use tokio_util::sync::CancellationToken;
             use uuid::Uuid;
 
@@ -3007,7 +3025,7 @@ mod tests {
                     "test.local".to_string(),
                 ),
                 remote_addr: "127.0.0.1:1234".parse().unwrap(),
-                auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
+                auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated(
                     buzz_auth::AuthContext {
                         pubkey: key.public_key(),
                         scopes: vec![],
@@ -3171,7 +3189,7 @@ mod tests {
         use nostr::{EventBuilder, Keys, Kind, Tag};
         use std::collections::HashMap;
         use std::sync::Arc;
-        use tokio::sync::{mpsc, RwLock};
+        use tokio::sync::mpsc;
         use tokio_util::sync::CancellationToken;
         use uuid::Uuid;
 
@@ -3195,7 +3213,7 @@ mod tests {
             conn_id: Uuid::new_v4(),
             tenant: buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string()),
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
-            auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
+            auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated(
                 buzz_auth::AuthContext {
                     pubkey: agent_keys.public_key(),
                     scopes: vec![],

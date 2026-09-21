@@ -789,7 +789,7 @@ impl HuddleOwnerRegistry {
     /// tests that exercise the fan-out to the control loop / WS peers in
     /// isolation from the (separately tested) renewer timing.
     #[cfg(test)]
-    fn install_for_test(&self, session_id: Uuid, generation: u64) -> CancellationToken {
+    pub(crate) fn install_for_test(&self, session_id: Uuid, generation: u64) -> CancellationToken {
         let lost = CancellationToken::new();
         self.entries.insert(
             session_id,
@@ -801,6 +801,20 @@ impl HuddleOwnerRegistry {
             },
         );
         lost
+    }
+
+    /// Return the generation stored for `session_id`, or `None` if absent.
+    /// Used by caller-schedule tests to verify the entry's generation without
+    /// accessing the private `entries` map directly.
+    #[cfg(test)]
+    pub(crate) fn generation_for(&self, session_id: Uuid) -> Option<u64> {
+        self.entries.get(&session_id).map(|e| e.generation)
+    }
+
+    /// Return `true` if there is a live entry for `session_id`.
+    #[cfg(test)]
+    pub(crate) fn has_entry(&self, session_id: Uuid) -> bool {
+        self.entries.contains_key(&session_id)
     }
 }
 
@@ -1402,6 +1416,14 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
         match room.add_peer(pubkey.to_string(), protocol_version) {
             Ok((peer_id, peer_index, epoch, audio_rx, _peer_ctrl_rx, roster_revision)) => {
                 registered.insert(pubkey.to_string(), peer_id);
+                // Fix 7b: mark the remote peer as committed immediately after
+                // registration. The mesh owner does not run a DB transaction for
+                // remote peers (admission is controlled by the ingress pod); the
+                // "committed" flag guards `roster_snapshot()` and resync payloads.
+                // Without this, the owner's snapshot omits all live remote
+                // participants — desktop treats the snapshot as a replacement
+                // roster and drops their audio. [FI-TRACE-REMOTE-PEER-COMMITTED]
+                room.mark_committed(peer_id);
                 // The owner's Room fans out to this remote peer's `audio_tx`;
                 // the sink drains `audio_rx` and ships each frame as a datagram
                 // to the pod that hosts the client.
