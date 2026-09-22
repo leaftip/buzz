@@ -2224,9 +2224,12 @@ pub(crate) mod tests {
     /// checks resolve to `AdmissionError::Unavailable` without any live
     /// infrastructure. Shared with `crate::rejection`'s tests.
     pub(crate) async fn test_state() -> Arc<AppState> {
-        // hermetic_for_test: env-free — never races NIP-FI env-var mutations
-        // from concurrent nip_fi_config tests in the same binary. [F6]
-        let mut config = crate::config::Config::hermetic_for_test();
+        // hermetic_for_test_with_db_from_env: NIP-FI env parsing is isolated
+        // (never races nip_fi_config tests), but database_url is taken from
+        // DATABASE_URL / BUZZ_TEST_DATABASE_URL so postgres_tests that call
+        // `sqlx::PgPool::connect(&state.config.database_url)` reach a real DB
+        // in CI.  Falls back to port-1 stub in unit-test runs.  [F6]
+        let mut config = crate::config::Config::hermetic_for_test_with_db_from_env();
         config.require_relay_membership = false;
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
         build_test_state(config, pool).await
@@ -3810,13 +3813,27 @@ pub(crate) mod tests {
                      mutation: disconnect_nip_fi hook path never reached",
             );
 
-        // FIXED: blocks until deny drops the lock (after try_send + cancel).
-        // MUTATION: runs cancel immediately, before try_send.
-        control.disconnect_community();
+        // F7 fix: spawn disconnect_community on an independent worker so the main
+        // thread remains free to send `proceed` to the hook.  disconnect_community
+        // blocks on the transition lock (held by deny) — calling it directly on main
+        // while the hook holds the lock waiting for main's proceed creates a circular
+        // wait.
+        //
+        // FIXED: disconnect_community acquires the lock — blocks until deny drops it
+        // after try_send, so community's cancel fires after the payload is enqueued.
+        // MUTATION: disconnect_community without the lock — cancel fires before try_send.
+        let control_for_dc = control.clone();
+        let dc_thread = std::thread::spawn(move || {
+            control_for_dc.disconnect_community();
+        });
 
-        // Allow the hook to proceed (hook is blocking on hook_proceed_rx).
+        // Allow the hook to proceed (deny can now complete try_send, then drop the
+        // lock so disconnect_community can acquire it).
         hook_proceed_tx.send(()).unwrap();
 
+        dc_thread
+            .join()
+            .expect("W_cancel_race: disconnect_community thread panicked");
         deny_thread
             .join()
             .expect("W_cancel_race: deny thread panicked");
@@ -3995,13 +4012,27 @@ pub(crate) mod tests {
                      mutation: expiry_deny_terminal hook path never reached",
             );
 
-        // FIXED: blocks until expiry drops the lock (after try_send).
-        // MUTATION (remove lock from disconnect_community): cancels before try_send.
-        control.disconnect_community();
+        // F7 fix: spawn disconnect_community on an independent worker so the main
+        // thread remains free to send `proceed` to the hook.  disconnect_community
+        // blocks on the transition lock (held by expiry) — calling it directly on main
+        // while the hook holds the lock waiting for main's proceed creates a circular
+        // wait.
+        //
+        // FIXED: disconnect_community acquires the lock — blocks until expiry drops it
+        // after try_send, so community's cancel fires after the payload is enqueued.
+        // MUTATION (remove lock from disconnect_community): cancel fires before try_send.
+        let control_for_dc = control.clone();
+        let dc_thread = std::thread::spawn(move || {
+            control_for_dc.disconnect_community();
+        });
 
-        // Allow the hook to proceed.
+        // Allow the hook to proceed (expiry can now complete try_send, then drop the
+        // lock so disconnect_community can acquire it).
         hook_proceed_tx.send(()).unwrap();
 
+        dc_thread
+            .join()
+            .expect("W_expiry_cancel_race: disconnect_community thread panicked");
         expiry_thread
             .join()
             .expect("W_expiry_cancel_race: expiry thread panicked");
@@ -4184,13 +4215,27 @@ pub(crate) mod tests {
                      mutation: pairing_deny_terminal hook path never reached",
             );
 
-        // FIXED: blocks until pairing drops the lock (after try_send).
-        // MUTATION (remove lock from disconnect_community): cancels before try_send.
-        control.disconnect_community();
+        // F7 fix: spawn disconnect_community on an independent worker so the main
+        // thread remains free to send `proceed` to the hook.  disconnect_community
+        // blocks on the transition lock (held by pairing) — calling it directly on main
+        // while the hook holds the lock waiting for main's proceed creates a circular
+        // wait.
+        //
+        // FIXED: disconnect_community acquires the lock — blocks until pairing drops it
+        // after try_send, so community's cancel fires after the payload is enqueued.
+        // MUTATION (remove lock from disconnect_community): cancel fires before try_send.
+        let control_for_dc = control.clone();
+        let dc_thread = std::thread::spawn(move || {
+            control_for_dc.disconnect_community();
+        });
 
-        // Allow the hook to proceed.
+        // Allow the hook to proceed (pairing can now complete try_send, then drop the
+        // lock so disconnect_community can acquire it).
         hook_proceed_tx.send(()).unwrap();
 
+        dc_thread
+            .join()
+            .expect("W_pairing_cancel_race: disconnect_community thread panicked");
         pairing_thread
             .join()
             .expect("W_pairing_cancel_race: pairing thread panicked");
@@ -4344,12 +4389,27 @@ pub(crate) mod tests {
                      mutation: auth_deny_terminal hook path never reached",
             );
 
-        // FIXED: blocks until auth drops the lock (after try_send).
-        control.disconnect_community();
+        // F7 fix: spawn disconnect_community on an independent worker so the main
+        // thread remains free to send `proceed` to the hook.  disconnect_community
+        // blocks on the transition lock (held by auth) — calling it directly on main
+        // while the hook holds the lock waiting for main's proceed creates a circular
+        // wait.
+        //
+        // FIXED: disconnect_community acquires the lock — blocks until auth drops it
+        // after try_send, so community's cancel fires after the payload is enqueued.
+        // MUTATION: disconnect_community without the lock — cancel fires before try_send.
+        let control_for_dc = control.clone();
+        let dc_thread = std::thread::spawn(move || {
+            control_for_dc.disconnect_community();
+        });
 
-        // Allow the hook to proceed.
+        // Allow the hook to proceed (auth can now complete try_send, then drop the
+        // lock so disconnect_community can acquire it).
         hook_proceed_tx.send(()).unwrap();
 
+        dc_thread
+            .join()
+            .expect("W_auth_cancel_race: disconnect_community thread panicked");
         auth_thread
             .join()
             .expect("W_auth_cancel_race: auth thread panicked");
@@ -4519,12 +4579,27 @@ pub(crate) mod tests {
                      mutation: manager_disconnect_nip_fi hook path never reached",
             );
 
-        // FIXED: blocks until manager drops the lock (after try_send).
-        control.disconnect_community();
+        // F7 fix: spawn disconnect_community on an independent worker so the main
+        // thread remains free to send `proceed` to the hook.  disconnect_community
+        // blocks on the transition lock (held by manager) — calling it directly on main
+        // while the hook holds the lock waiting for main's proceed creates a circular
+        // wait.
+        //
+        // FIXED: disconnect_community acquires the lock — blocks until manager drops it
+        // after try_send, so community's cancel fires after the payload is enqueued.
+        // MUTATION: disconnect_community without the lock — cancel fires before try_send.
+        let control_for_dc = control.clone();
+        let dc_thread = std::thread::spawn(move || {
+            control_for_dc.disconnect_community();
+        });
 
-        // Allow the hook to proceed.
+        // Allow the hook to proceed (manager can now complete try_send, then drop the
+        // lock so disconnect_community can acquire it).
         hook_proceed_tx.send(()).unwrap();
 
+        dc_thread
+            .join()
+            .expect("W_manager_cancel_race: disconnect_community thread panicked");
         manager_thread
             .join()
             .expect("W_manager_cancel_race: manager thread panicked");

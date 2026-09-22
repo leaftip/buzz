@@ -2476,9 +2476,14 @@ mod tests {
         use crate::state::AppState;
 
         pub(super) fn test_config() -> crate::config::Config {
-            // hermetic_for_test: env-free — never races NIP-FI env-var mutations
-            // from concurrent nip_fi_config tests. [F6: ambient NIP-FI fixture race]
-            let mut config = crate::config::Config::hermetic_for_test();
+            // hermetic_for_test_with_db_from_env: env-free for NIP-FI parsing
+            // (never races nip_fi_config tests), but picks up DATABASE_URL /
+            // BUZZ_TEST_DATABASE_URL so that DB-backed helpers in
+            // presence_storage_postgres_tests that call
+            // `sqlx::PgPool::connect(&state.config.database_url)` reach a real
+            // DB in CI.  Falls back to the port-1 stub in unit-test runs.
+            // [F6: hermetic NIP-FI + real DB URL for postgres helpers]
+            let mut config = crate::config::Config::hermetic_for_test_with_db_from_env();
             config.require_relay_membership = false;
             config
         }

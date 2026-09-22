@@ -549,6 +549,37 @@ pub(crate) async fn handle_active_audio_connection(
         };
     }
 
+    // Shared finalization for explicit pre-writer error exits after terminal
+    // registration.  Drains any denial frame already enqueued by a concurrent
+    // admin/expiry path and sends the matching policy close code, so a denial
+    // that raced in while the membership or protocol check was awaiting is
+    // never silently discarded.  Used at every error return between terminal
+    // registration and send_loop startup.  [R2: invariant boundary — Fix-2]
+    //
+    // Unlike check_cancel!() this is unconditional: the handler is returning
+    // due to its own error, and the race window means a winning denial may or
+    // may not have enqueued its frame yet.  The drain is always safe: an empty
+    // channel is a no-op; a non-empty channel means a denial won the race and
+    // its frame must reach the client before this error return.
+    //
+    // Sends are bounded by a 1-second flush deadline so a stalled WS sink
+    // cannot hold the handler indefinitely on an error exit.
+    macro_rules! drain_terminal {
+        () => {{
+            use futures_util::SinkExt as _;
+            let _drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                let _ = tokio::time::timeout_at(_drain_deadline, ws_send.send(msg)).await;
+            }
+            let nip_fi_close_reason = *disconnect_reason.borrow();
+            if let Some(reason) = nip_fi_close_reason {
+                let _ =
+                    tokio::time::timeout_at(_drain_deadline, ws_send.send(reason.close_message()))
+                        .await;
+            }
+        }};
+    }
+
     if crate::api::relay_members::enforce_relay_membership(
         &state,
         tenant.community(),
@@ -567,6 +598,10 @@ pub(crate) async fn handle_active_audio_connection(
                     .into(),
             ))
             .await;
+        // Drain any concurrent denial that raced in while the membership check
+        // was awaiting — terminal_ctrl_rx holds the denial frame, disconnect_reason
+        // holds the close code.  [R2: pre-writer invariant boundary]
+        drain_terminal!();
         return;
     }
     // Test hook: fires immediately before the first check_cancel!() so W_FIX1
@@ -597,6 +632,8 @@ pub(crate) async fn handle_active_audio_connection(
                         .into(),
                 ))
                 .await;
+            // [R2: pre-writer invariant boundary]
+            drain_terminal!();
             return;
         }
     };
@@ -644,6 +681,8 @@ pub(crate) async fn handle_active_audio_connection(
                         .into(),
                     ))
                     .await;
+                // [R2: pre-writer invariant boundary]
+                drain_terminal!();
                 return;
             }
             match crate::audio::join::resolve_join_owner_ready(
@@ -680,6 +719,8 @@ pub(crate) async fn handle_active_audio_connection(
                             .into(),
                         ))
                         .await;
+                    // [R2: pre-writer invariant boundary]
+                    drain_terminal!();
                     return;
                 }
             }
@@ -705,6 +746,8 @@ pub(crate) async fn handle_active_audio_connection(
                         .into(),
                     ))
                     .await;
+                // [R2: pre-writer invariant boundary]
+                drain_terminal!();
                 return;
             }
         }
@@ -744,6 +787,8 @@ pub(crate) async fn handle_active_audio_connection(
             state
                 .audio_rooms
                 .cleanup_if_empty(tenant.community(), channel_id);
+            // [R2: pre-writer invariant boundary]
+            drain_terminal!();
             return;
         }
         Err(e) => {
@@ -757,6 +802,8 @@ pub(crate) async fn handle_active_audio_connection(
             state
                 .audio_rooms
                 .cleanup_if_empty(tenant.community(), channel_id);
+            // [R2: pre-writer invariant boundary]
+            drain_terminal!();
             return;
         }
         Ok(_) => {} // Channel exists and is not archived — proceed.
@@ -796,6 +843,8 @@ pub(crate) async fn handle_active_audio_connection(
                 tracing::warn!(channel_id = %channel_id, "version-mismatch-exit lease release failed: {e}");
             }
         }
+        // [R2: pre-writer invariant boundary]
+        drain_terminal!();
         return;
     }
 
@@ -2397,16 +2446,17 @@ async fn commit_participant_join(
     room: &std::sync::Arc<crate::audio::room::Room>,
 ) -> Result<CommitJoinOutcome, JoinCommitError> {
     // 1. Sign the 48101 event synchronously.
-    // Include lifecycle_generation so Desktop reconciliation can compare against
-    // liveness responses — without it, an already-hydrated observer sees a JOIN
-    // without a generation, treats it as "pending", and then clears admissions
-    // when the next authoritative liveness response (with a real generation)
-    // differs.  [F3: lifecycle_generation in 48101 JOIN]
+    // Include `generation` (matching the wire key Desktop's `lifecycleContent` parser
+    // reads at `huddlePresence.ts:83-85`) so Desktop reconciliation can compare
+    // against liveness responses — without it, an already-hydrated observer sees
+    // a JOIN without a generation, treats it as "pending", and then clears
+    // admissions when the next authoritative liveness response (with a real
+    // generation) differs.  [F3: generation key in 48101 JOIN — Carl review]
     let content = serde_json::json!({
         "ephemeral_channel_id": channel_id.to_string(),
         "roster_revision": roster_revision,
         "admission_id": peer_id.to_string(),
-        "lifecycle_generation": lifecycle_generation,
+        "generation": lifecycle_generation,
     })
     .to_string();
 
@@ -5520,10 +5570,13 @@ mod tests {
         // `state.huddle_liveness_generation` for Off-mode rooms — so the JOIN's
         // embedded generation will equal the next liveness response, and Desktop
         // reconciliation will NOT clear the admission.  [F3: liveness-consumer equality]
+        //
+        // Wire key is "generation" — matches Desktop's lifecycleContent parser
+        // at huddlePresence.ts:83-85 (`content.generation`).  [Carl review]
         assert_eq!(
-            content_json["lifecycle_generation"].as_str(),
+            content_json["generation"].as_str(),
             Some(generation_string.as_str()),
-            "F3: 48101 JOIN content must include lifecycle_generation = {generation_string:?} \
+            "F3: 48101 JOIN content must include generation = {generation_string:?} \
              (must match state.huddle_liveness_generation, the same source used by the \
              Off-mode liveness consumer); got content: {content_str}"
         );
@@ -7524,9 +7577,12 @@ mod tests {
             .expect("F4 add-peer: challenge field")
             .to_string();
 
-        let relay_url = "ws://test.local";
+        // Derive relay URL from fixture tenant — must match nip42_expected_relay_url(
+        // &state.config.relay_url, &tenant) computed in handle_active_audio_connection.
+        // hermetic_for_test relay_url uses "ws://" scheme; host is tenant.host().
+        let relay_url = format!("ws://{}", tenant.host());
         let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
-            .tag(nostr::Tag::parse(["relay", relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
             .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
             .sign_with_keys(&member_key)
             .unwrap();
@@ -7724,9 +7780,11 @@ mod tests {
             .expect("F4 commit: challenge field")
             .to_string();
 
-        let relay_url = "ws://test.local";
+        // Derive relay URL from fixture tenant — must match nip42_expected_relay_url(
+        // &state.config.relay_url, &tenant) computed in handle_active_audio_connection.
+        let relay_url = format!("ws://{}", tenant.host());
         let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
-            .tag(nostr::Tag::parse(["relay", relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
             .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
             .sign_with_keys(&member_key)
             .unwrap();
@@ -7939,9 +7997,11 @@ mod tests {
             .expect("R2: challenge field")
             .to_string();
 
-        let relay_url = "ws://test.local";
+        // Derive relay URL from fixture tenant — must match nip42_expected_relay_url(
+        // &state.config.relay_url, &tenant) computed in handle_active_audio_connection.
+        let relay_url = format!("ws://{}", tenant.host());
         let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
-            .tag(nostr::Tag::parse(["relay", relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
             .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
             .sign_with_keys(&member_key)
             .unwrap();

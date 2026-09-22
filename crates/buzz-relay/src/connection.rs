@@ -832,14 +832,33 @@ async fn send_loop_inner<S>(
             biased;
             Some(restart) = restart_rx.recv() => {
                 // R1: an already-winning NIP-FI denial must be delivered before
-                // (and instead of) the 1012 restart close.  If the terminal
-                // channel holds a denial frame we honour that winning reason
-                // under the same bounded deadline, signal the restart sender
-                // that their 1012 was not sent (sent=false), and exit.  Only
-                // when no denial is queued do we send the 1012 as before.
-                // [FI-INV-05, R1 fix]
+                // (and instead of) the 1012 restart close.  If a NIP-FI denial
+                // has won the reason slot (disconnect_reason = AuthorizationDenied),
+                // wait for its frame to be enqueued — the reason is set before
+                // try_send under the transition lock, so we may see the reason
+                // before the frame arrives.  Only when no denial reason is set
+                // do we send the 1012 as before.  [FI-INV-05, R1 fix]
                 let deadline = tokio::time::Instant::now() + WS_TERMINAL_FLUSH_TIMEOUT;
-                if let Ok(denial_frame) = terminal_ctrl_rx.try_recv() {
+                let denial_reason = *disconnect_reason.borrow();
+                // Attempt to receive the denial frame.  If reason is set,
+                // wait up to the flush deadline for the enqueue to complete
+                // (tiny window between reason publication and try_send).
+                // If reason is unset, try_recv immediately (empty → no denial).
+                let maybe_frame = if matches!(
+                    denial_reason,
+                    Some(CommunityDisconnectReason::AuthorizationDenied)
+                ) {
+                    // Reason won — wait for the frame with a bounded deadline.
+                    // In the common case it is already present; in the race
+                    // window it arrives within microseconds.
+                    tokio::time::timeout_at(deadline, terminal_ctrl_rx.recv())
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    terminal_ctrl_rx.try_recv().ok()
+                };
+                if let Some(denial_frame) = maybe_frame {
                     // A denial already won: deliver it and its close code ahead
                     // of the restart 1012.  The restart close is not sent
                     // (flushed=false) — the denial reason takes precedence.
@@ -2687,7 +2706,7 @@ pub(crate) mod tests {
             "R1: first frame must be the denial frame, not 1012 — \
              got {:?}. \
              Mutation: remove terminal_ctrl_rx check from restart arm → 1012 sent instead → panics.",
-            msgs.get(0)
+            msgs.first()
         );
         // Last frame must be a Close (the denial close code, not 1012).
         let last = msgs.last().expect("at least one frame");
@@ -2698,8 +2717,21 @@ pub(crate) mod tests {
                     axum::extract::ws::close_code::RESTART,
                     "R1: close code must not be 1012 (restart) when denial won"
                 );
+                assert_eq!(
+                    close.code,
+                    axum::extract::ws::close_code::POLICY,
+                    "R1: close code must be 1008 (POLICY) when denial won; got {}. \
+                     Mutation: remove disconnect_reason.borrow() close_message() call → \
+                     wrong close code → panics.",
+                    close.code
+                );
             }
-            WsMessage::Close(None) => {}
+            WsMessage::Close(None) => {
+                panic!(
+                    "R1: last frame must be Close(Some(1008 POLICY)), got Close(None) — \
+                     denial close code must be present when denial won the reason slot"
+                );
+            }
             other => panic!("R1: last frame must be Close, got {other:?}"),
         }
     }

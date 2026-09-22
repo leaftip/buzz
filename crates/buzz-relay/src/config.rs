@@ -1396,6 +1396,34 @@ impl Config {
             nip_fi: crate::nip_fi_config::NipFiRelayConfig::off_for_test(),
         }
     }
+
+    /// Like [`hermetic_for_test`] but overrides `database_url` from the
+    /// canonical CI/local-dev env-var chain
+    /// (`BUZZ_TEST_DATABASE_URL` → `DATABASE_URL`)
+    /// so DB-backed fixture helpers that call
+    /// `sqlx::PgPool::connect(&state.config.database_url)` reach a real
+    /// database instead of the unreachable port-1 stub.
+    ///
+    /// Use this when you need the NIP-FI env isolation of `hermetic_for_test`
+    /// **and** a real DB URL in `config.database_url` — e.g. the
+    /// `presence_storage_postgres_tests` or the W2 durable DB assertion.
+    ///
+    /// Falls back to the port-1 stub when neither env var is set, preserving
+    /// the correct fail-closed behaviour for unit tests that never touch a DB.
+    ///
+    /// Only available in test builds.
+    #[cfg(test)]
+    pub fn hermetic_for_test_with_db_from_env() -> Self {
+        let mut config = Self::hermetic_for_test();
+        // Prefer the explicit CI wrapper var; fall back to the generic DATABASE_URL.
+        if let Some(url) = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .ok()
+            .or_else(|| std::env::var("DATABASE_URL").ok())
+        {
+            config.database_url = url;
+        }
+        config
+    }
 }
 
 /// Process-wide mutex for tests that mutate environment variables.

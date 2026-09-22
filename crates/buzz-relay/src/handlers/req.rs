@@ -2767,23 +2767,25 @@ mod tests {
         let session_id = Uuid::new_v4();
         let creator_key = nostr::Keys::generate();
         let creator_bytes = creator_key.public_key().to_bytes().to_vec();
+        let host = format!("f3-liveness-{}.example", community_uuid.simple());
 
-        // Community.
+        // Community — schema requires (id, host); no relay_pubkey column in schema.sql.
         sqlx::query(
-            "INSERT INTO communities (id, relay_pubkey) VALUES ($1, $2) \
+            "INSERT INTO communities (id, host) VALUES ($1, $2) \
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(community_uuid)
-        .bind(&creator_bytes)
+        .bind(&host)
         .execute(&pool)
         .await
         .expect("F3 liveness: seed community");
 
-        // Parent channel.
+        // Parent channel — channel_type enum has 'stream', 'forum', 'dm', 'workflow'.
+        // Conflict key is (community_id, id) per schema PRIMARY KEY.
         sqlx::query(
             "INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by) \
-             VALUES ($1, $2, 'f3-parent', 'team', 'open', $3) \
-             ON CONFLICT (id) DO NOTHING",
+             VALUES ($1, $2, 'f3-parent', 'stream', 'open', $3) \
+             ON CONFLICT (community_id, id) DO NOTHING",
         )
         .bind(parent_channel_id)
         .bind(community_uuid)
@@ -2793,10 +2795,12 @@ mod tests {
         .expect("F3 liveness: seed parent channel");
 
         // Audio session channel (ephemeral_channel_id in the huddle_started link).
+        // `huddle_started_links` JOINs on backing.created_by = start.pubkey, so
+        // the channel's created_by MUST equal creator_bytes.
         sqlx::query(
             "INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by) \
              VALUES ($1, $2, 'f3-session', 'stream', 'open', $3) \
-             ON CONFLICT (id) DO NOTHING",
+             ON CONFLICT (community_id, id) DO NOTHING",
         )
         .bind(session_id)
         .bind(community_uuid)
@@ -2805,12 +2809,16 @@ mod tests {
         .await
         .expect("F3 liveness: seed session channel");
 
-        // Huddle-started link event (kind 48100) linking parent → session.
-        // `huddle_started_links` query uses this to resolve the session_id→parent_channel_id
-        // mapping when the liveness REQ comes in.
+        // Huddle-started link event (kind KIND_HUDDLE_STARTED = 48100) linking
+        // parent → session.  `huddle_started_links` filters on:
+        //   start.channel_id = parent_channel_id (the REQ's parent_channel_ids)
+        //   start.kind = KIND_HUDDLE_STARTED
+        //   content::json ->> 'ephemeral_channel_id' = session_id::text
+        //   start.pubkey = backing.created_by (creator_bytes)
+        // Use the named constant — no arithmetic.
         let link_content =
             serde_json::json!({ "ephemeral_channel_id": session_id.to_string() }).to_string();
-        let link_event_id = Uuid::new_v4().as_bytes().to_vec(); // 16-byte dummy id
+        let link_event_id = Uuid::new_v4().as_bytes().to_vec(); // 16-byte dummy id; BYTEA, no size constraint
         sqlx::query(
             "INSERT INTO events \
              (community_id, id, pubkey, created_at, kind, tags, content, sig, channel_id) \
@@ -2818,27 +2826,24 @@ mod tests {
              ON CONFLICT DO NOTHING",
         )
         .bind(community_uuid)
-        .bind(&link_event_id[..]) // 16 bytes works for testing
+        .bind(&link_event_id[..])
         .bind(&creator_bytes)
-        .bind(crate::handlers::req::KIND_HUDDLE_LIVENESS as i32 - 1) // placeholder: use 48100 directly
+        .bind(buzz_core::kind::KIND_HUDDLE_STARTED as i32)
         .bind(&link_content)
-        .bind(vec![0u8; 64])
+        .bind(vec![0u8; 64]) // 64-byte dummy sig
         .bind(parent_channel_id)
         .execute(&pool)
         .await
-        .ok(); // best-effort; if schema differs this just returns EOSE which is acceptable
+        .expect("F3 liveness: seed KIND_HUDDLE_STARTED link event");
 
         // Register a non-empty audio room so handle_huddle_liveness_req finds
         // the session alive and returns the Off-mode generation.
-        // The room must have at least one peer; add a mock peer entry.
         let room = state.audio_rooms.get_or_create(community_id, session_id);
-        // add_peer needs pubkey + version; use a minimal peer for liveness check.
-        // If add_peer fails (e.g. room pinned to wrong version), the test will
-        // still prove the EOSE path; generation equality holds either way.
         let _ = room.add_peer(creator_key.public_key().to_hex(), 1);
 
         // Expected generation: what both the JOIN producer and liveness consumer use.
-        // Production path: audio/handler.rs:716 → state.huddle_liveness_generation.to_string()
+        // Production path: audio/handler.rs → `"generation": lifecycle_generation`
+        //   where lifecycle_generation = state.huddle_liveness_generation.to_string()
         // Liveness path: handlers/req.rs:1260 → state.huddle_liveness_generation.to_string()
         let expected_generation = state.huddle_liveness_generation.to_string();
 
@@ -2851,10 +2856,7 @@ mod tests {
 
         let conn = Arc::new(crate::connection::ConnectionState {
             conn_id: Uuid::new_v4(),
-            tenant: buzz_core::tenant::TenantContext::resolved(
-                community_id,
-                "test.local".to_string(),
-            ),
+            tenant: buzz_core::tenant::TenantContext::resolved(community_id, host),
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
             auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated(
                 buzz_auth::AuthContext {
@@ -2924,38 +2926,48 @@ mod tests {
             }
         }
 
-        // If the liveness handler returned an EVENT, its generation must equal the JOIN generation.
-        // If no EVENT (huddle_started_links returned empty because of minimal DB seed),
-        // we've still proven the code path works without error.
-        if let Some(gen) = liveness_gen {
-            assert_eq!(
-                gen, expected_generation,
-                "F3 liveness: liveness response generation ({gen}) must equal \
-                 state.huddle_liveness_generation ({expected_generation}). \
-                 Both paths use the same source field — a mismatch here means Desktop \
-                 would clear admissions for Off-mode sessions. \
-                 Mutation A: change req.rs:1260 to a different UUID → gen != expected → panics."
-            );
-        } else {
-            // EOSE without EVENT: the huddle_started_links DB seed may have failed
-            // due to schema differences, but the code path itself is proven correct
-            // (no panic, no error — the function returns gracefully on empty results).
-            // The generation equality invariant holds by source: both producer
-            // (audio/handler.rs:716) and consumer (req.rs:1260) read
-            // `state.huddle_liveness_generation.to_string()`.
-            eprintln!(
-                "F3 liveness: no liveness EVENT returned (huddle_started_links seed may \
-                 not have matched the query — schema-dependent). Source equality invariant \
-                 holds: both paths use state.huddle_liveness_generation."
-            );
-        }
+        // The liveness EVENT is required.  The fixture seeds a valid KIND_HUDDLE_STARTED
+        // link event (kind 48100), a live room with a peer, and schema-correct community/
+        // channel rows — handle_huddle_liveness_req must return an EVENT.
+        // A missing EVENT is a fixture or production defect, not an acceptable pass.
+        //
+        // Desktop consumer contract (huddlePresence.ts:464-483):
+        //   Desktop records the JOIN's `generation` field, then on each liveness
+        //   KIND_HUDDLE_LIVENESS response compares `event.content.generation`
+        //   against the stored value.  A mismatch clears the peer's admission.
+        //   Both paths use state.huddle_liveness_generation.to_string() — they
+        //   must be equal to preserve Off-mode admissions.
+        //
+        // Mutation evidence:
+        //   A) Change req.rs:1260 to use a different UUID →
+        //      `gen != expected_generation` → panics.
+        //   B) Change audio/handler.rs commit content key from "generation" to
+        //      anything else → Desktop cannot find the field → Desktop sees null
+        //      vs the liveness generation → clears admissions.
+        let gen = liveness_gen.expect(
+            "F3 liveness: handle_huddle_liveness_req must return a liveness EVENT — \
+             the fixture seeds a valid community (host), schema-correct stream channels, \
+             a KIND_HUDDLE_STARTED link event, and a live room with a peer. \
+             A missing EVENT means the fixture seed failed or the handler has a bug. \
+             Mutation A: remove KIND_HUDDLE_STARTED link → no EVENT → panics here (correct). \
+             Mutation B: change req.rs:1260 generation source → wrong generation → \
+             assert_eq below panics.",
+        );
+        assert_eq!(
+            gen, expected_generation,
+            "F3 liveness: liveness response generation ({gen}) must equal \
+             state.huddle_liveness_generation ({expected_generation}). \
+             Both paths use the same source field — a mismatch here means Desktop \
+             would clear admissions for Off-mode sessions. \
+             Mutation: change req.rs:1260 to a different UUID → gen != expected → panics."
+        );
     }
 
     mod postgres_tests {
         /// F3: liveness response generation equals JOIN-embedded generation for Off-mode rooms.
         ///
         /// Proves the relay-side invariant that both `commit_participant_join`
-        /// (audio/handler.rs:716) and `handle_huddle_liveness_req` (req.rs:1260)
+        /// (audio/handler.rs) and `handle_huddle_liveness_req` (req.rs:1260)
         /// read `state.huddle_liveness_generation.to_string()` — so Desktop never
         /// clears Off-mode admissions due to a generation mismatch.
         ///
