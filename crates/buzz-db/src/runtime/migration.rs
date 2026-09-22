@@ -490,6 +490,8 @@ mod postgres_tests {
             "relay_admin_outbox",
             "relay_operator_audit",
             "storage_accounting_snapshots",
+            "operator_listener_pubkeys",
+            "operator_listener_outbox",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
                 globals.insert(value.to_owned());
@@ -703,7 +705,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 47);
+        assert_eq!(migrations.len(), 48);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1288,10 +1290,58 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("CREATE TABLE storage_accounting_snapshots"));
-        // schema.sql exclusion list must match the restored (pre-0041) body.
+        assert_eq!(migrations[47].version, 48);
+        assert!(migrations[47]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE operator_listener_pubkeys"));
+        assert!(migrations[47]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE operator_listener_outbox"));
+        assert!(migrations[47]
+            .sql
+            .as_str()
+            .contains("CREATE OR REPLACE FUNCTION community_write_fence_excluded_table"));
+        assert!(migrations[47]
+            .sql
+            .as_str()
+            .contains("'rate_limit_violations', 'operator_listener_outbox'"));
+        for index in [
+            "operator_listener_pubkeys_target",
+            "operator_listener_pubkeys_created_at",
+            "operator_listener_outbox_due",
+            "operator_listener_outbox_recovery",
+            "operator_listener_outbox_created_at",
+        ] {
+            assert!(
+                migrations[47].sql.as_str().contains(index),
+                "migration 0048 must declare {index}"
+            );
+            assert!(
+                desired_schema.contains(index),
+                "schema.sql must declare {index}"
+            );
+        }
+        for index_shape in [
+            "ON operator_listener_outbox (next_attempt_at, created_at, id)",
+            "ON operator_listener_outbox (lease_until, created_at, id)",
+        ] {
+            assert!(
+                migrations[47].sql.as_str().contains(index_shape),
+                "migration 0048 must declare {index_shape}"
+            );
+            assert!(
+                desired_schema.contains(index_shape),
+                "schema.sql must declare {index_shape}"
+            );
+        }
+        // schema.sql keeps the restored (pre-0041) deletion exclusions and also
+        // leaves the deployment-global listener outbox outside tenant fencing.
         assert!(
-            desired_schema.contains("'rate_limit_violations'\n    ]::TEXT[])"),
-            "schema.sql exclusion list must match the pre-0041 body after ledger removal"
+            desired_schema
+                .contains("'rate_limit_violations', 'operator_listener_outbox'\n    ]::TEXT[])"),
+            "schema.sql must exclude the deployment-global listener outbox from tenant fencing"
         );
     }
 

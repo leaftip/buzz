@@ -54,6 +54,44 @@ struct TransferCommunityResponse {
 
 const OPERATOR_REPLAY_SCOPE: &str = "operator-management";
 
+#[derive(Debug, Deserialize)]
+struct ListenerPubkeysRequest {
+    pubkeys: Vec<String>,
+}
+
+fn parse_listener_pubkeys(body: &[u8]) -> Result<Vec<Vec<u8>>, (StatusCode, Json<Value>)> {
+    let request: ListenerPubkeysRequest = serde_json::from_slice(body).map_err(|e| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("invalid operator-listener pubkeys JSON: {e}"),
+        )
+    })?;
+    if request.pubkeys.is_empty() || request.pubkeys.len() > 1_000 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "pubkeys must contain between 1 and 1000 entries",
+        ));
+    }
+    request
+        .pubkeys
+        .into_iter()
+        .map(|value| {
+            let normalized = validate_pubkey_hex(&value).ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "pubkeys must contain 64-char hex public keys",
+                )
+            })?;
+            hex::decode(normalized).map_err(|_| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "pubkeys must contain 64-char hex public keys",
+                )
+            })
+        })
+        .collect()
+}
+
 /// Shared deployment-global operator auth prelude. The canonical management
 /// origin and replay namespace are configuration, never tenant registry state
 /// or an inbound proxy `Host` header.
@@ -103,6 +141,86 @@ async fn authorize_operator_request(
     }
 
     Ok(pubkey)
+}
+
+/// Authenticate a deployment-global operator listener using its configured
+/// identity and a NIP-98 request signature.
+async fn authorize_operator_listener_request(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<nostr::PublicKey, (StatusCode, Json<Value>)> {
+    let origin = state
+        .config
+        .relay_operator_api_origin
+        .as_deref()
+        .ok_or_else(|| internal_error("operator API origin is not configured"))?;
+    let url = format!("{origin}{path}");
+    let bridge::VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        ..
+    } = bridge::verify_bridge_auth_with_options(headers, method, &url, Some(body), true, true)?;
+    check_operator_replay(state, event_id_bytes).await?;
+    if !state
+        .config
+        .operator_listener_delivery_urls
+        .contains_key(&pubkey.to_hex())
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "actor not authorized: not a configured operator listener",
+        ));
+    }
+    Ok(pubkey)
+}
+
+/// Register target pubkeys for the authenticated operator listener.
+pub async fn register_listener_pubkeys(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let listener = authorize_operator_listener_request(
+        &state,
+        &headers,
+        "POST",
+        "/operator/listener/pubkeys",
+        &body,
+    )
+    .await?;
+    let target_pubkeys = parse_listener_pubkeys(&body)?;
+    state
+        .db
+        .register_operator_listener_pubkeys(listener.as_bytes(), &target_pubkeys)
+        .await
+        .map_err(|e| internal_error(&format!("register operator-listener pubkeys: {e}")))?;
+    Ok(Json(serde_json::json!({})))
+}
+
+/// Remove target pubkeys for the authenticated operator listener.
+pub async fn remove_listener_pubkeys(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let listener = authorize_operator_listener_request(
+        &state,
+        &headers,
+        "DELETE",
+        "/operator/listener/pubkeys",
+        &body,
+    )
+    .await?;
+    let target_pubkeys = parse_listener_pubkeys(&body)?;
+    state
+        .db
+        .remove_operator_listener_pubkeys(listener.as_bytes(), &target_pubkeys)
+        .await
+        .map_err(|e| internal_error(&format!("remove operator-listener pubkeys: {e}")))?;
+    Ok(Json(serde_json::json!({})))
 }
 
 async fn check_operator_replay(

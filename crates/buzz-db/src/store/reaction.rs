@@ -227,6 +227,11 @@ pub async fn insert_reaction_event_with_thread_metadata(
     )
     .await?;
 
+    if was_inserted {
+        crate::insert_mentions_in_transaction(&mut tx, community_id, reaction_event, channel_id)
+            .await?;
+    }
+
     tx.commit().await?;
 
     Ok(ReactionEventInsertOutcome::Inserted {
@@ -578,16 +583,6 @@ impl Db {
             emoji,
         )
         .await?;
-        if let ReactionEventInsertOutcome::Inserted {
-            was_inserted: true, ..
-        } = &outcome
-        {
-            if let Err(e) =
-                crate::insert_mentions(&self.pool, community_id, event, channel_id).await
-            {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-            }
-        }
         Ok(outcome)
     }
 

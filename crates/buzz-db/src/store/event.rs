@@ -355,12 +355,18 @@ pub async fn insert_event(
     event: &Event,
     channel_id: Option<Uuid>,
 ) -> Result<(StoredEvent, bool)> {
-    let mut connection = crate::observability::acquire_writer(
+    let connection = crate::observability::acquire_writer(
         pool,
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    insert_event_on(&mut connection, community_id, event, channel_id).await
+    let mut tx = Transaction::begin(connection, None).await?;
+    let result = insert_event_on(tx.as_mut(), community_id, event, channel_id).await?;
+    if result.1 {
+        crate::insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
+    }
+    tx.commit().await?;
+    Ok(result)
 }
 
 /// Insert a Nostr event in a caller-owned PostgreSQL transaction.
@@ -374,7 +380,11 @@ pub async fn insert_event_in_transaction(
     event: &Event,
     channel_id: Option<Uuid>,
 ) -> Result<(StoredEvent, bool)> {
-    insert_event_on(tx.as_mut(), community_id, event, channel_id).await
+    let result = insert_event_on(tx.as_mut(), community_id, event, channel_id).await?;
+    if result.1 {
+        crate::insert_mentions_in_transaction(tx, community_id, event, channel_id).await?;
+    }
+    Ok(result)
 }
 
 async fn insert_event_on(
@@ -1528,6 +1538,9 @@ pub async fn insert_event_with_thread_metadata(
     let result =
         insert_event_with_thread_metadata_tx(&mut tx, community_id, event, channel_id, thread_meta)
             .await?;
+    if result.1 {
+        crate::insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
+    }
     tx.commit().await?;
     Ok(result)
 }
@@ -1543,13 +1556,6 @@ impl Db {
     ) -> Result<(StoredEvent, bool)> {
         let result =
             crate::event::insert_event(&self.pool, community_id, event, channel_id).await?;
-        if result.1 {
-            if let Err(e) =
-                crate::insert_mentions(&self.pool, community_id, event, channel_id).await
-            {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-            }
-        }
         Ok(result)
     }
 
@@ -2057,13 +2063,6 @@ impl Db {
             thread_meta,
         )
         .await?;
-        if result.1 {
-            if let Err(e) =
-                crate::insert_mentions(&self.pool, community_id, event, channel_id).await
-            {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-            }
-        }
         Ok(result)
     }
 

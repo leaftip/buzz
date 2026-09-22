@@ -118,6 +118,7 @@ pub(crate) async fn insert_mentions_in_transaction(
 
         qb.build().execute(&mut **tx).await?;
     }
+    crate::operator_listener::enqueue_mentions_in_transaction(tx, community_id, event).await?;
     Ok(())
 }
 
@@ -1258,12 +1259,10 @@ impl Db {
             None,
         )
         .await?;
-        tx.commit().await?;
         if result.1 {
-            if let Err(e) = insert_mentions(&self.pool, community_id, event, channel_id).await {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-            }
+            insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
         }
+        tx.commit().await?;
         Ok(result)
     }
 

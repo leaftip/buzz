@@ -63,12 +63,6 @@ impl Db {
         let mut tx = self.begin_event_write_transaction().await?;
         let (stored, inserted) =
             crate::event::insert_event_in_transaction(&mut tx, community_id, event, None).await?;
-        if inserted {
-            // Unlike best-effort indexing for ordinary events, deletion fails
-            // closed: its public request and discoverability commit together.
-            crate::runtime::insert_mentions_in_transaction(&mut tx, community_id, event, None)
-                .await?;
-        }
         let outcome = delete_workflow_in_transaction(
             &mut tx,
             community_id,
