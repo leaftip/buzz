@@ -1081,6 +1081,34 @@ mod tests {
     // explicit: admin `registry.disconnect_nip_fi` → expiry task quiesces →
     // task completes → teardown removes subscriptions.
     //
+    // ── Scope and known limits ─────────────────────────────────────────────
+    //
+    // This test exercises the quiescence invariant via the production components
+    // (`CommunityConnectionRegistry`, `spawn_nip_fi_expiry_task`,
+    // `registry.disconnect_nip_fi`) and the sub_registry primitives directly.
+    // It deliberately does NOT run `handle_req` or `pubsub.release_topic`.
+    //
+    // Why: The full production teardown (including `release_topic` per
+    // removed scope and `conn_manager.deregister`) lives in
+    // `handle_active_connection`'s epilogue (connection.rs:631–648), which is
+    // only callable by driving a live WebSocket through `handle_connection` —
+    // an end-to-end integration test requiring a real relay+TLS socket, not a
+    // unit-test primitive.  A `handle_req` test (W3 already exists) exercises
+    // permit acquisition and early-exit paths but does not trigger the epilogue.
+    //
+    // What this test verifies:
+    //   - The quiescence barrier (`gate.quiesce()`) blocks the expiry task
+    //     until the last pre-cancel permit-holder drops.
+    //   - Admin disconnect via the real `CommunityConnectionRegistry` path
+    //     enqueues exactly one terminal frame (Audio-format denial frame —
+    //     `CommunityConnectionControl` always uses Audio JSON).
+    //   - `sub_registry.remove_connection` finds and removes the subscription
+    //     registered while quiescence was blocked — zero orphans.
+    //
+    // What is NOT verified here (requires live-socket integration test):
+    //   - `pubsub.release_topic` called for each removed scope.
+    //   - `conn_manager.deregister` called after task completion.
+    //
     // Contract:
     //   - Exactly one terminal frame enqueued by the admin path (not by quiesce).
     //   - Task blocked until permit is released (quiescence proof).
@@ -1150,10 +1178,15 @@ mod tests {
         let frame = terminal_rx
             .try_recv()
             .expect("W_f5_teardown: admin disconnect must enqueue exactly one terminal frame");
-        let expected = crate::nip_fi_session::authorization_denied_frame(NipFiWsRoute::Root);
+        // `CommunityConnectionRegistry::disconnect_nip_fi` delegates to
+        // `CommunityConnectionControl::disconnect_nip_fi`, which always enqueues
+        // the Audio-route denial frame (audio JSON, not NOTICE).  Root-path
+        // connections use `ConnectionManager::disconnect_nip_fi` instead.
+        let expected = crate::nip_fi_session::authorization_denied_frame(NipFiWsRoute::Audio);
         assert_eq!(
             frame, expected,
-            "W_f5_teardown: terminal frame must be the canonical Root denial frame"
+            "W_f5_teardown: terminal frame must be the canonical Audio denial frame \
+             (CommunityConnectionRegistry path always sends Audio format)"
         );
 
         // ── Step 4: task is now in its cancel arm, blocked in quiesce().

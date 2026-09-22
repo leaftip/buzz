@@ -5498,9 +5498,9 @@ mod tests {
     // absent generation.
     //
     // Mutation evidence:
-    //   Remove `"lifecycle_generation": lifecycle_generation` from the content
-    //   JSON in `commit_participant_join` → the field is absent → the assertion
-    //   on `content_json["lifecycle_generation"]` panics.
+    //   Remove `"generation": lifecycle_generation` from the content JSON in
+    //   `commit_participant_join` → the field is absent → the assertion on
+    //   `content_json["generation"]` panics.
     //   Use a hard-coded string instead of `state.huddle_liveness_generation` →
     //   the lifecycle/liveness equality assertion panics (generation mismatch).
     async fn f3_commit_participant_join_includes_lifecycle_generation_body() {

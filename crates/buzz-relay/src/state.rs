@@ -362,6 +362,11 @@ impl CommunityConnectionControl {
     /// loop never encounters a frame after it has already drained and closed.
     /// [FI-TRACE-CANCEL-RACE, F2: lifecycle-cancel ordering]
     pub(crate) fn lifecycle_cancel(&self) {
+        // Signal the test that we have entered lifecycle_cancel and are about to
+        // acquire the lock.  Fires before the lock so the test observes arrival
+        // rather than assuming it via a timing window.  [F7: bounded arrival]
+        #[cfg(test)]
+        lifecycle_cancel_entry_hook::fire(self.hook_key);
         let _lock = self
             .terminal_frame_tx
             .lock()
@@ -2172,6 +2177,52 @@ pub(crate) mod manager_race_test_hook {
         let cb = hook_map().lock().unwrap().get(&key).cloned();
         if let Some(f) = cb {
             f();
+        }
+    }
+}
+
+/// Test-only one-shot arrival hook for `lifecycle_cancel`.
+///
+/// Fires at the ENTRY of `lifecycle_cancel`, before the transition lock is
+/// acquired.  Tests arm a receiver via `arm(hook_key)` and wait for the signal
+/// to confirm the worker thread has entered `lifecycle_cancel` and is about to
+/// contend on the lock (which the manager_race_test_hook is still holding).
+/// This replaces the `std::thread::sleep` timing window — the blocked/about-to-
+/// contend state is OBSERVED, not assumed.  [F7: bounded arrival coordination]
+///
+/// Zero-cost in production.
+#[cfg(test)]
+pub(crate) mod lifecycle_cancel_entry_hook {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static HOOKS: OnceLock<Mutex<HashMap<uuid::Uuid, std::sync::mpsc::Sender<()>>>> =
+        OnceLock::new();
+
+    fn hook_map() -> &'static Mutex<HashMap<uuid::Uuid, std::sync::mpsc::Sender<()>>> {
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Arm a one-shot signal for `key`. Returns the receiver the test waits on.
+    pub(crate) fn arm(key: uuid::Uuid) -> std::sync::mpsc::Receiver<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        hook_map().lock().unwrap().insert(key, tx);
+        rx
+    }
+
+    /// Disarm the hook for `key` (cleanup after test).
+    #[allow(dead_code)]
+    pub(crate) fn disarm(key: uuid::Uuid) {
+        hook_map().lock().unwrap().remove(&key);
+    }
+
+    /// Called at the entry of `lifecycle_cancel`.
+    /// No-op when not armed for this key.
+    pub(crate) fn fire(key: uuid::Uuid) {
+        let tx = hook_map().lock().unwrap().remove(&key);
+        if let Some(t) = tx {
+            let _ = t.send(());
         }
     }
 }
@@ -4794,6 +4845,10 @@ pub(crate) mod tests {
         // blocks on the transition lock (held by manager) — this is what we are
         // proving.  Calling it directly on main while the hook holds the lock
         // waiting for main's proceed creates a circular wait.
+        //
+        // Arm the entry hook BEFORE spawning so the receiver is ready before
+        // the thread can fire it.
+        let arrival_rx = lifecycle_cancel_entry_hook::arm(control.hook_key);
         let control_for_lc = control.clone();
         let lc_thread = std::thread::spawn(move || {
             // FIXED: lifecycle_cancel acquires the lock — blocks until manager
@@ -4804,13 +4859,17 @@ pub(crate) mod tests {
             control_for_lc.lifecycle_cancel();
         });
 
-        // Brief bounded pause to let the lc_thread enter the lock-acquisition
-        // path before the hook proceeds.  The hook still holds the lock here,
-        // so the thread will block on lock().  This establishes contention before
-        // release — without it the spawn might not have called lifecycle_cancel
-        // yet and the test would pass trivially (no contention).  [F7: bounded
-        // arrival coordination]
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Wait for the lc_thread to enter lifecycle_cancel (observed via arrival
+        // hook, not assumed via sleep).  At this point the thread has fired the
+        // hook and is about to acquire the lock, which the manager hook still
+        // holds.  The blocked/contending state is established before we release.
+        // [F7: bounded arrival coordination]
+        arrival_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "W_lifecycle_cancel_race: lifecycle_cancel_entry_hook never fired — \
+                     lc_thread did not reach lifecycle_cancel within 5 s",
+            );
 
         // Allow the hook to proceed (manager's try_send can now complete,
         // then drops the lock so lifecycle_cancel can acquire it).
@@ -4961,6 +5020,10 @@ pub(crate) mod tests {
         // thread) — this is what we are proving.  Calling drain_all directly on
         // main while the hook holds the lock waiting for main's proceed creates a
         // circular wait.
+        //
+        // Arm the entry hook BEFORE spawning so the receiver is ready before
+        // the thread can fire it.  [F7: bounded arrival coordination]
+        let arrival_rx = lifecycle_cancel_entry_hook::arm(hook_key);
         let mgr_for_drain = Arc::clone(&mgr);
         let drain_thread = std::thread::spawn(move || {
             // FIXED: lifecycle_cancel acquires the lock → blocks until deny's
@@ -4970,12 +5033,17 @@ pub(crate) mod tests {
             mgr_for_drain.drain_all();
         });
 
-        // Brief bounded pause to let the drain_thread enter lifecycle_cancel's
-        // lock-acquisition path before the hook proceeds.  The hook still holds
-        // the lock, so the thread will block.  Establishes contention before
-        // release — ensures the test exercises the blocking path rather than
-        // passing trivially with no contention.  [F7: bounded arrival coordination]
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Wait for the drain_thread to enter lifecycle_cancel (observed via
+        // arrival hook, not assumed via sleep).  At this point the thread has
+        // fired the hook and is about to acquire the lock, which the deny hook
+        // still holds.  The blocked/contending state is established before we
+        // release.  [F7: bounded arrival coordination]
+        arrival_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "W_root_manager_drain_race: lifecycle_cancel_entry_hook never fired — \
+                     drain_thread did not reach lifecycle_cancel within 5 s",
+            );
 
         // Allow the hook to proceed (deny's try_send can now complete, then
         // drops the lock so drain_all's lifecycle_cancel can acquire it).
@@ -5116,6 +5184,10 @@ pub(crate) mod tests {
         // blocks on the transition lock (held by the deny thread) — this is
         // what we are proving.  Calling it directly on main while the hook
         // holds the lock waiting for main's proceed creates a circular wait.
+        //
+        // Arm the entry hook BEFORE spawning so the receiver is ready before
+        // the thread can fire it.  [F7: bounded arrival coordination]
+        let arrival_rx = lifecycle_cancel_entry_hook::arm(hook_key);
         let control_for_lc = control.clone();
         let lc_thread = std::thread::spawn(move || {
             // FIXED: lifecycle_cancel acquires the lock → blocks until deny's
@@ -5126,12 +5198,17 @@ pub(crate) mod tests {
             control_for_lc.lifecycle_cancel();
         });
 
-        // Brief bounded pause to let the lc_thread enter the lock-acquisition
-        // path before the hook proceeds.  The hook still holds the lock, so
-        // the thread will block.  Establishes contention before release —
-        // ensures the test exercises the blocking path rather than passing
-        // trivially with no contention.  [F7: bounded arrival coordination]
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Wait for the lc_thread to enter lifecycle_cancel (observed via
+        // arrival hook, not assumed via sleep).  At this point the thread has
+        // fired the hook and is about to acquire the lock, which the deny hook
+        // still holds.  The blocked/contending state is established before we
+        // release.  [F7: bounded arrival coordination]
+        arrival_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+            "W_audio_registry_lifecycle_cancel_race: lifecycle_cancel_entry_hook never fired — \
+                     lc_thread did not reach lifecycle_cancel within 5 s",
+        );
 
         // Allow the hook to proceed (deny's try_send can now complete, then
         // drops the lock so lifecycle_cancel can acquire it).
