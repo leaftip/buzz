@@ -104,12 +104,13 @@ pub(crate) async fn enforce_nip_fi_key_pairing(
                 proven_pubkey = %proven_pubkey.to_hex(),
                 "NIP-FI key pairing mismatch — closing connection"
             );
-            *conn.auth_state.write().await = crate::connection::AuthState::Failed;
+            *conn.auth_state.lock().unwrap() = crate::connection::AuthState::Failed;
             // Serialize through the terminal-transition lock: reason publication +
             // winner-only frame enqueue happen while the lock is held, so a
             // concurrent disconnect_community cannot fire cancel.cancel() before
-            // the winning payload is enqueued.  The auth_state write is async and
-            // must complete before acquiring the sync lock.  [FI-TRACE-CANCEL-RACE]
+            // the winning payload is enqueued.  The auth_state write uses the sync
+            // StdMutex and completes before acquiring the sync transition lock.
+            // [FI-TRACE-CANCEL-RACE]
             conn.community_control
                 .pairing_deny_terminal(&conn.terminal_ctrl_tx, NipFiWsRoute::Root);
             conn.cancel.cancel();
