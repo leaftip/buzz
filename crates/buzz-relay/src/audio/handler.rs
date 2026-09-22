@@ -5331,8 +5331,12 @@ mod tests {
     // ── F3: lifecycle_generation in committed 48101 JOIN ──────────────────────
     //
     // Verifies that `commit_participant_join` includes `lifecycle_generation` in
-    // the 48101 event content for both Enforce mode (with a real generation
-    // string) and Off mode (using the relay's global liveness generation).
+    // the 48101 event content in Off mode, and that the committed generation
+    // matches `state.huddle_liveness_generation` — the SAME source the liveness
+    // consumer (`handle_huddle_liveness_req`) uses for Off-mode (non-mesh) rooms.
+    // This proves Desktop reconciliation will NOT clear admissions: the
+    // generation embedded in the JOIN and the generation returned by the next
+    // authoritative liveness response are always equal.
     //
     // Without this field Desktop reconciliation assigns "pending" to the joining
     // peer and then clears admissions when the next authoritative liveness
@@ -5343,24 +5347,28 @@ mod tests {
     //   Remove `"lifecycle_generation": lifecycle_generation` from the content
     //   JSON in `commit_participant_join` → the field is absent → the assertion
     //   on `content_json["lifecycle_generation"]` panics.
+    //   Use a hard-coded string instead of `state.huddle_liveness_generation` →
+    //   the lifecycle/liveness equality assertion panics (generation mismatch).
     #[tokio::test]
+    #[ignore = "requires Postgres — postgres://buzz:buzz_dev@127.0.0.1:5432/buzz"]
     async fn f3_commit_participant_join_includes_lifecycle_generation() {
         use uuid::Uuid;
 
-        let state = match audio_test_state_real_db().await {
-            Some(s) => s,
-            None => {
-                eprintln!("F3: skipping — local DB not available at postgres://buzz:buzz_dev@127.0.0.1:5432/buzz");
-                return;
-            }
-        };
+        let state = audio_test_state_real_db()
+            .await
+            .expect("F3: local DB must be available (test is marked #[ignore])");
         let pool = state.db.pool().clone();
         let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
         let community_id = tenant.community();
         let pubkey_hex = member_key.public_key().to_hex();
         let pubkey_bytes = member_key.public_key().to_bytes().to_vec();
 
-        let generation_string = "test-lifecycle-gen-f3";
+        // Use the relay's global liveness generation — the SAME source that
+        // `handle_huddle_liveness_req` returns for Off-mode (non-mesh) rooms.
+        // This binds the test to the production path: audio/handler.rs line 716
+        // also falls back to `state.huddle_liveness_generation.to_string()` for
+        // Off-mode sessions.  A hard-coded string would break the equality proof.
+        let generation_string = state.huddle_liveness_generation.to_string();
 
         // Off-mode gate (no deadline → acquire_effect always succeeds).
         let off_cancel = tokio_util::sync::CancellationToken::new();
@@ -5375,7 +5383,7 @@ mod tests {
             &pubkey_bytes,
             Uuid::new_v4(),
             1,
-            generation_string,
+            &generation_string,
             &MembershipAdmission::Existing {
                 parent_channel_id: channel_id,
             },
@@ -5405,11 +5413,17 @@ mod tests {
         let content_json: serde_json::Value =
             serde_json::from_str(&content_str).expect("F3: 48101 content must be valid JSON");
 
+        // Primary assertion: generation field matches the relay's liveness generation.
+        // The liveness consumer (handle_huddle_liveness_req) returns the same
+        // `state.huddle_liveness_generation` for Off-mode rooms — so the JOIN's
+        // embedded generation will equal the next liveness response, and Desktop
+        // reconciliation will NOT clear the admission.  [F3: liveness-consumer equality]
         assert_eq!(
             content_json["lifecycle_generation"].as_str(),
-            Some(generation_string),
-            "F3: 48101 JOIN content must include lifecycle_generation = {generation_string:?}; \
-             got content: {content_str}"
+            Some(generation_string.as_str()),
+            "F3: 48101 JOIN content must include lifecycle_generation = {generation_string:?} \
+             (must match state.huddle_liveness_generation, the same source used by the \
+             Off-mode liveness consumer); got content: {content_str}"
         );
 
         assert!(

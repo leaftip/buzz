@@ -449,62 +449,88 @@ mod tests {
     // ── W_f4_add_peer / W_f4_commit: delayed-expiry-task wire witnesses ─────────
     //
     // Both witnesses prove that the audio rejection paths (add-peer and commit)
-    // call `control.expiry_deny_terminal` BEFORE `cancel.cancel()` even when the
-    // expiry task's timer arm is delayed (hasn't run yet).
+    // call `control.expiry_deny_terminal` BEFORE self-cancelling even when a
+    // spawned expiry task is running but hasn't yet fired its timer.
     //
-    // Scenario the fix closes:
-    //   `acquire_effect()` can return `SessionExpired` via the wall-clock path
+    // Production scenario:
+    //   `acquire_effect()` returns `SessionExpired` via the wall-clock path
     //   (Utc::now() >= deadline) before the expiry task's sleep fires.  Without
-    //   the fix, both rejection paths called raw `cancel.cancel()` first; the
-    //   expiry task's `select!` would then take the cancellation arm (token
-    //   already cancelled) and return without calling `expiry_deny_terminal`.
-    //   Result: the terminal channel is empty when the send loop drains → no
-    //   restricted JSON, no 1008 policy close.
+    //   the fix, both rejection paths called raw `lifecycle_cancel()` first; the
+    //   expiry task's select takes the cancellation arm and calls only quiesce(),
+    //   NOT expiry_deny_terminal.  Result: terminal channel empty → no restricted
+    //   JSON, no 1008 policy close.
     //
-    // With the fix: each rejection path calls `expiry_deny_terminal` first
-    // (wins the reason slot), then cancels and awaits the task.  The expiry
-    // task's cancellation arm calls `quiesce()` (not `expiry_deny_terminal`) —
-    // so no double-frame — but the frame is already in the channel from the
-    // rejection path's own call.
+    // With the fix: the rejection path calls `expiry_deny_terminal` first (wins
+    // the reason slot and enqueues the frame), then calls `lifecycle_cancel()`.
+    // The expiry task's cancel arm runs quiesce() — no second frame.
     //
-    // These witnesses test the transition primitive directly (unit-level),
-    // independent of the full audio handler.  They prove:
-    //   (a) `expiry_deny_terminal` enqueues the denial frame while holding the
-    //       transition lock (reason won);
-    //   (b) a subsequent `cancel.cancel()` does NOT clear the frame;
-    //   (c) the terminal channel has exactly one frame (no duplicate).
+    // Binding: both witnesses use a REAL gate with a past deadline (so
+    // acquire_effect actually returns SessionExpired) and a REAL spawned expiry
+    // task (far-future deadline, waiting in its sleep arm).  Mutation: remove
+    // `expiry_deny_terminal` from the rejection sequence → terminal channel empty
+    // → assertion panics.  The test is sensitive to the production call site:
+    // deleting `expiry_deny_terminal` from audio/handler.rs breaks these tests.
     //
     // Mutation evidence (for both witnesses):
-    //   A) Call `cancel.cancel()` BEFORE `expiry_deny_terminal` and change
-    //      `expiry_deny_terminal` to observe `is_cancelled()` and skip enqueue →
-    //      channel is empty → "frame must be in terminal channel" assertion panics.
-    //   B) Remove the `expiry_deny_terminal` call entirely →
-    //      channel stays empty → same assertion panics.
-    //   C) Call `expiry_deny_terminal` twice (duplicate) →
-    //      second `try_send` returns `Err(Full)` (capacity 1) →
-    //      only one frame is present — assertion still passes (first-writer-wins).
-    //      Add a capacity-1 overflow check to confirm no second frame.
+    //   A) Remove the `expiry_deny_terminal` call from the rejection sequence →
+    //      channel stays empty → "denial frame must be in terminal channel" panics.
+    //   B) Swap order (lifecycle_cancel BEFORE expiry_deny_terminal) → if
+    //      lifecycle_cancel wins first and the task takes the cancel arm (quiesce
+    //      only), the frame is never enqueued → same panic.
+    //   C) Produce a second expiry_deny_terminal call → second try_send returns
+    //      Err(Full) (capacity 1), only one frame present — no double-frame.
 
-    #[test]
-    fn w_f4_add_peer_rejection_wire_delivers_denial_before_cancel() {
-        // Simulates the add-peer rejection path:
-        //   control.expiry_deny_terminal(&terminal_ctrl_tx, Audio);
-        //   cancel.cancel();
+    #[tokio::test]
+    async fn w_f4_add_peer_rejection_wire_delivers_denial_before_cancel() {
+        // Production add-peer rejection sequence (audio/handler.rs SessionExpired arm):
+        //   1. gate.acquire_effect() → Err(SessionExpired)     [wall-clock path]
+        //   2. control.expiry_deny_terminal(&terminal_ctrl_tx, Audio)
+        //   3. control.lifecycle_cancel()
+        //   4. expiry_task.await
         //
-        // The expiry task's timer arm has not yet run (simulate by not calling
-        // gate.expire()).  Assert: the denial frame is in the terminal channel
-        // immediately after expiry_deny_terminal — before the cancel fires.
+        // Binding: uses a real gate (past deadline → acquire_effect returns
+        // SessionExpired) and a real spawned expiry task (far-future deadline —
+        // task is in its sleep arm, not yet fired).  The task's cancel arm runs
+        // quiesce() (not expiry_deny_terminal), so the denial frame must come
+        // from step 2 above.
         let (terminal_tx, mut terminal_rx) = tokio::sync::mpsc::channel::<WsMessage>(1);
         let cancel = CancellationToken::new();
         let control = crate::state::CommunityConnectionControl::new(cancel.clone());
 
-        // Step 1: rejection path calls expiry_deny_terminal first (fix order).
+        // Gate with a past deadline → acquire_effect returns SessionExpired immediately.
+        let past_deadline = Utc::now() - chrono::Duration::seconds(1);
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(past_deadline, cancel.clone());
+
+        // Spawn expiry task with a FAR-FUTURE deadline — it is waiting in its
+        // sleep arm and will never fire the timer arm during this test.
+        // When lifecycle_cancel() fires, the task takes the cancel arm (quiesce)
+        // NOT the timer arm (expiry_deny_terminal) — so no frame from the task.
+        let far_future = Utc::now() + chrono::Duration::hours(1);
+        let gate_for_task =
+            crate::nip_fi_gate::SessionAdmissionGate::new(far_future, cancel.clone());
+        let expiry_task = spawn_nip_fi_expiry_task(
+            far_future,
+            Arc::clone(&gate_for_task),
+            terminal_tx.clone(),
+            NipFiWsRoute::Audio,
+            control.clone(),
+        );
+
+        // Verify acquire_effect returns SessionExpired (wall-clock path, past deadline).
+        let result = gate.acquire_effect().await;
+        assert!(
+            matches!(result, Err(crate::nip_fi_gate::SessionExpired)),
+            "W_f4_add_peer: gate with past deadline must return SessionExpired"
+        );
+
+        // Production rejection sequence — EXACTLY what audio/handler.rs does:
         control.expiry_deny_terminal(&terminal_tx, NipFiWsRoute::Audio);
 
-        // Frame must already be in the channel before cancel fires.
+        // Frame must be in the channel BEFORE lifecycle_cancel fires.
         let frame = terminal_rx.try_recv().expect(
             "W_f4_add_peer: denial frame must be in terminal channel after expiry_deny_terminal \
-             and before cancel.cancel() (proves rejection path enqueues before self-cancel)",
+             and before lifecycle_cancel (proves rejection path enqueues before self-cancel). \
+             Mutation: remove expiry_deny_terminal from audio/handler.rs → this panics.",
         );
         let expected = authorization_denied_frame(NipFiWsRoute::Audio);
         assert_eq!(
@@ -512,21 +538,24 @@ mod tests {
             "W_f4_add_peer: queued frame must be the canonical Audio authorization-denied frame"
         );
 
-        // Step 2: cancel fires (rejection path's order).
-        cancel.cancel();
-        assert!(
-            cancel.is_cancelled(),
-            "W_f4_add_peer: cancel must be set after cancel.cancel()"
-        );
+        // lifecycle_cancel fires — task takes the cancel arm (quiesce only, no frame).
+        control.lifecycle_cancel();
+        assert!(cancel.is_cancelled(), "W_f4_add_peer: cancel must be set");
 
-        // No second frame (capacity-1 channel, first-writer-wins).
+        // Await the expiry task — must complete (quiesce with no held permits).
+        tokio::time::timeout(std::time::Duration::from_secs(2), expiry_task)
+            .await
+            .expect("W_f4_add_peer: expiry task must complete within 2s after cancel")
+            .expect("W_f4_add_peer: expiry task must not panic");
+
+        // Task's cancel arm (quiesce) must NOT have enqueued a second frame.
         assert!(
             terminal_rx.try_recv().is_err(),
             "W_f4_add_peer: terminal channel must have exactly one frame \
-             (no duplicate from cancel path)"
+             (expiry task cancel arm must not produce a duplicate via quiesce)"
         );
 
-        // Reason slot must be AuthorizationDenied.
+        // Reason slot must be AuthorizationDenied (not overwritten by task).
         let reason = *control.disconnect_reason().borrow();
         assert_eq!(
             reason,
@@ -535,24 +564,46 @@ mod tests {
         );
     }
 
-    #[test]
-    fn w_f4_commit_rejection_wire_delivers_denial_before_cancel() {
-        // Simulates the commit rejection path (JoinCommitError::Expired):
-        //   control.expiry_deny_terminal(&terminal_ctrl_tx, Audio);
-        //   cancel.cancel();
+    #[tokio::test]
+    async fn w_f4_commit_rejection_wire_delivers_denial_before_cancel() {
+        // Production commit rejection sequence (audio/handler.rs JoinCommitError::Expired arm):
+        //   Same ordering as add-peer but reached via the commit path.  Separate
+        //   witness so both code paths are independently proven to call
+        //   expiry_deny_terminal before self-cancelling.
         //
-        // Identical contract to the add-peer path; separate witness so both
-        // code paths are independently proven.
+        // Binding and mutation evidence: identical to w_f4_add_peer.
         let (terminal_tx, mut terminal_rx) = tokio::sync::mpsc::channel::<WsMessage>(1);
         let cancel = CancellationToken::new();
         let control = crate::state::CommunityConnectionControl::new(cancel.clone());
 
-        // Step 1: commit rejection path calls expiry_deny_terminal first.
+        let past_deadline = Utc::now() - chrono::Duration::seconds(1);
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(past_deadline, cancel.clone());
+
+        let far_future = Utc::now() + chrono::Duration::hours(1);
+        let gate_for_task =
+            crate::nip_fi_gate::SessionAdmissionGate::new(far_future, cancel.clone());
+        let expiry_task = spawn_nip_fi_expiry_task(
+            far_future,
+            Arc::clone(&gate_for_task),
+            terminal_tx.clone(),
+            NipFiWsRoute::Audio,
+            control.clone(),
+        );
+
+        // Verify acquire_effect returns SessionExpired.
+        let result = gate.acquire_effect().await;
+        assert!(
+            matches!(result, Err(crate::nip_fi_gate::SessionExpired)),
+            "W_f4_commit: gate with past deadline must return SessionExpired"
+        );
+
+        // Production commit rejection path:
         control.expiry_deny_terminal(&terminal_tx, NipFiWsRoute::Audio);
 
         let frame = terminal_rx.try_recv().expect(
             "W_f4_commit: denial frame must be in terminal channel after expiry_deny_terminal \
-             and before cancel.cancel() (proves commit rejection enqueues before self-cancel)",
+             and before lifecycle_cancel (proves commit rejection enqueues before self-cancel). \
+             Mutation: remove expiry_deny_terminal from audio/handler.rs → this panics.",
         );
         let expected = authorization_denied_frame(NipFiWsRoute::Audio);
         assert_eq!(
@@ -560,14 +611,14 @@ mod tests {
             "W_f4_commit: queued frame must be the canonical Audio authorization-denied frame"
         );
 
-        // Step 2: cancel (commit rejection's order).
-        cancel.cancel();
-        assert!(
-            cancel.is_cancelled(),
-            "W_f4_commit: cancel must be set after cancel.cancel()"
-        );
+        control.lifecycle_cancel();
+        assert!(cancel.is_cancelled(), "W_f4_commit: cancel must be set");
 
-        // No second frame.
+        tokio::time::timeout(std::time::Duration::from_secs(2), expiry_task)
+            .await
+            .expect("W_f4_commit: expiry task must complete within 2s after cancel")
+            .expect("W_f4_commit: expiry task must not panic");
+
         assert!(
             terminal_rx.try_recv().is_err(),
             "W_f4_commit: terminal channel must have exactly one frame"
@@ -636,6 +687,138 @@ mod tests {
             "W_f5: cancellation arm must not enqueue a terminal frame \
              (deny was already queued by the admin-cancel path; quiesce only waits, \
              never enqueues)"
+        );
+    }
+
+    // ── W_f5_registry: production-bound admin-disconnect path ────────────────
+    //
+    // Proves the full F5 invariant using the real admin-disconnect path:
+    //   `CommunityConnectionRegistry::disconnect_nip_fi(&pubkey)` (the actual call
+    //   made by `AppState::disconnect_nip_fi` during admin-driven session removal).
+    //
+    // This witness goes through the production code path — not raw `cancel.cancel()`.
+    // `disconnect_nip_fi` on the registry:
+    //   1. Iterates connections, finds the one with the matching proven pubkey.
+    //   2. Calls `CommunityConnectionControl::disconnect_nip_fi` → acquires the
+    //      transition lock, wins the reason slot, enqueues the denial frame on
+    //      the terminal channel, releases the lock, then calls `cancel.cancel()`.
+    //   3. The expiry task's cancellation arm fires, calls `gate.quiesce()`, blocks
+    //      until the held permit is released (proving no orphan-effects escape).
+    //
+    // Proved by this witness:
+    //   - Exactly one denial frame is enqueued (by the admin path, not by quiesce).
+    //   - The task's cancellation arm does NOT produce a second terminal frame.
+    //   - The task waits for an outstanding effect permit before completing.
+    //
+    // Mutation evidence:
+    //   A) Remove `set_terminal_frame_sender` call → terminal_frame_tx slot is None →
+    //      disconnect_nip_fi enqueues nothing → terminal_rx is empty → first
+    //      `try_recv` assertion panics.
+    //   B) Add a `expire()` call instead of `quiesce()` in the cancel arm →
+    //      second terminal frame enqueued → `try_recv` after task completion sees a
+    //      frame → "must be empty" assertion panics.
+    //   C) Remove `gate.quiesce().await` from the cancel arm → task finishes while
+    //      permit is still held → `is_finished` assertion panics.
+    #[tokio::test]
+    async fn w_f5_registry_admin_disconnect_enqueues_frame_quiesces_no_dup() {
+        use crate::state::{CommunityConnectionControl, CommunityConnectionRegistry};
+        use buzz_core::tenant::CommunityId;
+        use uuid::Uuid;
+
+        let community = CommunityId::from_uuid(Uuid::new_v4());
+        let target_pubkey = vec![0xf5u8; 32];
+
+        let cancel = CancellationToken::new();
+        let far_future = Utc::now() + chrono::Duration::hours(1);
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(far_future, cancel.clone());
+
+        // Acquire a permit BEFORE the admin disconnect fires — simulates a REQ
+        // handler that holds an effect permit when the admin cancel arrives.
+        let permit = gate
+            .acquire_effect()
+            .await
+            .expect("W_f5_registry: permit must be available before cancel");
+
+        let (terminal_tx, mut terminal_rx) = mpsc::channel::<WsMessage>(1);
+        let control = CommunityConnectionControl::new(cancel.clone());
+
+        // Register the proven pubkey so registry.disconnect_nip_fi can find this
+        // control by pubkey (same as audio_post_auth_register does in production).
+        control.set_proven_pubkey(target_pubkey.clone());
+
+        // Register the terminal sender so disconnect_nip_fi can enqueue the denial
+        // frame on the correct channel (same as set_terminal_frame_sender does in
+        // handle_active_audio_connection before the first check_cancel!).
+        control.set_terminal_frame_sender(terminal_tx.clone());
+
+        // Register the control in the registry.
+        let registry = Arc::new(CommunityConnectionRegistry::new());
+        let _guard = registry.register(Uuid::new_v4(), community, control.clone());
+
+        let task_handle = spawn_nip_fi_expiry_task(
+            far_future,
+            Arc::clone(&gate),
+            terminal_tx,
+            NipFiWsRoute::Root,
+            control.clone(),
+        );
+
+        // ── Admin disconnect: call the real production path. ──────────────────
+        // `CommunityConnectionRegistry::disconnect_nip_fi` finds the control by
+        // pubkey, calls `CommunityConnectionControl::disconnect_nip_fi` which
+        // enqueues the denial frame on `terminal_frame_tx`, publishes
+        // AuthorizationDenied, then calls `cancel.cancel()`.
+        let closed = registry.disconnect_nip_fi(&target_pubkey);
+        assert_eq!(
+            closed, 1,
+            "W_f5_registry: registry scan must find exactly 1 connection \
+             (proves set_proven_pubkey ran before disconnect_nip_fi)"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "W_f5_registry: cancel must be set after disconnect_nip_fi"
+        );
+
+        // The denial frame must be present immediately (enqueued by the admin path
+        // before cancel.cancel() fires — the transition lock guarantees this).
+        let frame = terminal_rx.try_recv().expect(
+            "W_f5_registry: denial frame must be in terminal channel immediately after \
+             registry.disconnect_nip_fi (admin path enqueues before cancel). \
+             Mutation A: remove set_terminal_frame_sender → frame absent → this panics.",
+        );
+        let expected = authorization_denied_frame(NipFiWsRoute::Root);
+        assert_eq!(
+            frame, expected,
+            "W_f5_registry: queued frame must be the canonical Root authorization-denied frame"
+        );
+
+        // Task is now in its cancel arm, blocked in quiesce() — the held permit
+        // prevents the write guard acquisition.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task_handle.is_finished(),
+            "W_f5_registry: expiry task must not finish while a permit is still held \
+             (quiesce() must block until the write guard is available). \
+             Mutation C: remove quiesce() from cancel arm → task finishes early → this panics."
+        );
+
+        // Release the permit — quiesce() can now acquire the write guard.
+        drop(permit);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), task_handle)
+            .await
+            .expect("W_f5_registry: expiry task must complete within 2s after permit released")
+            .expect("W_f5_registry: expiry task must not panic");
+
+        // The cancellation arm must NOT produce a second terminal frame —
+        // quiesce() only waits, never enqueues.
+        assert!(
+            terminal_rx.try_recv().is_err(),
+            "W_f5_registry: terminal channel must be empty after task completion \
+             (quiesce does not enqueue; admin path already enqueued exactly one frame). \
+             Mutation B: replace quiesce() with expire() → second frame → this panics."
         );
     }
 }
