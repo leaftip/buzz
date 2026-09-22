@@ -1221,8 +1221,24 @@ pub(crate) async fn handle_active_audio_connection(
             // Fix B (remote path): now that the ingress DB transaction has
             // committed, tell the owner that this peer's slot is committed so
             // the owner calls `commit_peer` (fires the joined delta + marks
-            // committed). Best-effort: if the stream is already gone, the
-            // owner's teardown will remove the pending slot on stream close.
+            // committed).
+            //
+            // Error handling: a failed send (encode error or transport error)
+            // must not leave a permanently invisible committed participant. The
+            // owner's `pending_registered` slot is drained when the control
+            // stream closes — so on any send failure we drop `remote_stream`
+            // immediately, triggering EOF on the owner's `serve_control_loop`,
+            // which runs the pending-teardown path and silently removes the
+            // pending slot via `remove_remote_peer_pending`. The peer is
+            // committed in the DB and media flows through the pre-allocated
+            // index; the owner handles the stale slot on stream close.
+            //
+            // Hung stream (CommitConfirmed never sent, stream stays open): the
+            // owner's `pending_registered` slot stays until the stream closes.
+            // This is bounded by the pod lease lifetime — when the owner lease
+            // expires or the pod drains, the control stream receives a Goodbye
+            // and the pending drain fires. A per-slot timeout is not added here;
+            // the lease lifetime is the practical upper bound.
             // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
             if let (Some(stream), Some(pk)) = (
                 guard.remote_stream.as_mut(),
@@ -1237,12 +1253,21 @@ pub(crate) async fn handle_active_audio_connection(
                     .as_ref()
                     .expect("remote_stream implies remote_session")
                     .fenced();
-                if let Ok(payload) =
-                    encode_control(&HuddleControlMsg::CommitConfirmed { pubkey: pk })
-                {
-                    let _ = stream
+                let sent = match encode_control(&HuddleControlMsg::CommitConfirmed { pubkey: pk }) {
+                    Ok(payload) => stream
                         .send_frame(buzz_relay_mesh::MeshStreamFrame::Data { fenced, payload })
-                        .await;
+                        .await
+                        .is_ok(),
+                    Err(_) => false,
+                };
+                if !sent {
+                    // Drop the stream so the owner sees EOF and drains the
+                    // pending slot via `remove_remote_peer_pending` on teardown.
+                    tracing::warn!(
+                        "Fix-B: CommitConfirmed send failed; dropping control stream \
+                         so owner drains pending slot on EOF"
+                    );
+                    guard.remote_stream = None;
                 }
             }
         }
@@ -2609,9 +2634,22 @@ async fn commit_participant_join(
     // marks the peer committed, increments the roster revision, and fires
     // the joined delta on `Room::roster_tx` — so the delta is only visible
     // to other control loops AFTER the DB transaction has committed.
+    // The return value (ingress-mirror revision) is used by the same-pod path
+    // below (`joined_snapshot.revision`). On the cross-pod path the owner-domain
+    // revision is used instead; the call is still required to mark committed and
+    // enable snapshot filtering.
+    //
+    // Cross-pod note: `commit_peer` also sends a `RosterDelta` on the ingress
+    // mirror's `roster_tx`. The only production subscriber of `subscribe_roster`
+    // on a room is the owner-pod's `serve_control_loop` (join.rs), and that loop
+    // never subscribes the ingress mirror room — it uses the owner-pod room. The
+    // delta is therefore unconsumed by design. No forwarding path reads it and
+    // it is not delivered to clients. This is intentional: the ingress mirror is
+    // a local accounting structure; all client-visible state flows through the
+    // owner-pod `CommitConfirmed` → `commit_peer` → `broadcast_control` path.
     // [Fix 7: FI-TRACE-PENDING-PEER-LEAK]
     // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
-    let commit_revision = room.commit_peer(peer_id);
+    let _commit_revision = room.commit_peer(peer_id);
 
     // Fix 7a: build the joined payload from committed state — after
     // commit_peer, roster_snapshot includes the joining peer (peer_id) plus
@@ -2651,10 +2689,19 @@ async fn commit_participant_join(
                 serde_json::json!({"pubkey": pubkey_hex, "peer_index": peer_index, "epoch": peer_epoch}),
             );
         }
-        // Use the post-commit revision if available; fall back to owner snapshot
-        // revision for the cross-pod path (commit_revision is None only if the
-        // peer slot was removed before confirmation, an unreachable steady-state).
-        let rev = commit_revision.unwrap_or(owner.revision);
+        // Cross-pod path: always use the owner-domain snapshot revision.
+        // `commit_peer` on the ingress mirror still fires (marks committed,
+        // enables snapshot filtering), but its return revision is a
+        // mirror-local counter in a different domain — ingress clients also
+        // receive owner-domain revisions (forwarded deltas, resync snapshots)
+        // and desktop orders events by `rosterRevision`, so a mirror-rev
+        // published after a higher owner-rev snapshot would be discarded as
+        // stale. Use `owner.revision` — the pre-joiner owner-domain snapshot
+        // revision already present in the owner roster payload — so the
+        // joining client and any ingress-local listener see a consistent
+        // owner-domain revision.
+        // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH — cross-pod revision domain]
+        let rev = owner.revision;
         (rev, peers)
     } else {
         let joined_snapshot = room.roster_snapshot();
@@ -7533,14 +7580,19 @@ mod tests {
                  Mutation oracle: pass None as owner_roster → ingress-local room snapshot \
                  used → alice absent → this assertion panics"
             );
-            // Revision comes from commit_peer (post-commit ingress revision), not
-            // the owner snapshot. The ingress room has listener (revision 1) + bob
-            // committed (revision 2). commit_revision = Some(2) wins over owner.revision=5.
-            // This is the correct Fix-B behavior: the revision reflects when the peer
-            // was actually made visible on the owner.
-            assert!(
-                parsed["revision"].as_u64().is_some(),
-                "F7a-cross-pod: joined broadcast must have a numeric revision; got {parsed:?}"
+            // Revision must be the owner-domain snapshot revision (= 5 in the fixture),
+            // not an ingress-mirror revision. The cross-pod branch always uses
+            // `owner.revision` — the pre-joiner owner-domain value — so clients ordering
+            // by `rosterRevision` against owner-domain values never see a stale-looking
+            // cross-pod join.
+            assert_eq!(
+                parsed["revision"].as_u64(),
+                Some(owner_snapshot.revision),
+                "F7a-cross-pod: joined broadcast revision must equal the owner-domain snapshot \
+                 revision ({});  got {parsed:?}\n\
+                 Mutation oracle: restore `commit_revision.unwrap_or(owner.revision)` → \
+                 ingress-mirror rev (2) wins → assertion panics with 2 ≠ 5",
+                owner_snapshot.revision
             );
         }
 
@@ -7550,116 +7602,306 @@ mod tests {
         // the "failed admissions invisible" invariant and the "commit-before-publish"
         // ordering. These are the wire-level tests Paul's dispatch required.
         //
-        // ── Fix-B witness W1: owner-local rollback → no delta emitted ────────────
+        // ── Fix-B witness W1+W3 (handler-level wire): pre-commit cancel → zero deltas ──
         //
-        // `commit_participant_join` rolls back via the Expired path (cancel fired
-        // before the function is called, so `acquire_effect` returns immediately
-        // with `SessionExpired`). The pending peer slot must be removed silently —
-        // the roster delta channel must contain zero events.
+        // Drives the REAL `handle_active_audio_connection` via Axum + tungstenite +
+        // full NIP-42. Alice is pre-seeded in the room as an observer; Bob connects
+        // and gets as far as `add_peer_pending` (hook fires). Cancel fires → handler
+        // B1 check → `guard.release_before_commit()` → `room.remove_peer_silent(bob_id)`.
+        // Alice's roster-delta channel must be empty throughout.
+        //
+        // This replaces the earlier W1/W3 unit tests that called
+        // `room.remove_peer_silent` directly in the test body, which proved the
+        // function's behaviour but NOT the production caller path.
         //
         // ## Mutation oracle
         //
-        // W1-A) Change `remove_peer_silent` → `remove_peer` in `release_before_commit` →
-        //       delta emitted after rollback → `deltas.try_recv()` succeeds → panics.
-        // W1-B) Publish the peer at `add_peer_pending` time (swap to `add_peer`) →
-        //       joined delta appears before rollback → panics.
+        // W1-A) Change `remove_peer_silent` → `remove_peer` in **production**
+        //       `release_before_commit` (handler.rs, HuddleAdmissionGuard) →
+        //       a `left` delta fires → Alice's `delta_rx.try_recv()` succeeds → RED.
+        // W1-B) Swap `add_peer_pending` → `add_peer` in the production handler →
+        //       a `joined` delta fires at admission → `delta_rx.try_recv()` succeeds → RED.
+        //
+        // Both mutations are executed against production code paths; neither touches
+        // test-only code.
         #[tokio::test]
         #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
-        async fn fix_b_w1_rollback_emits_no_delta() {
+        async fn fix_b_w1_w3_handler_pre_commit_cancel_emits_no_delta() {
+            use buzz_auth::VerifiedAssertion;
+            use buzz_relay_mesh::wire::FencedHeader;
+            use buzz_relay_mesh::MeshError;
             use chrono::{Duration, Utc};
+            use futures_util::StreamExt as _;
             use std::sync::Arc;
+            use tokio::net::TcpListener;
+            use tokio_tungstenite::connect_async;
 
+            use crate::audio::join::{
+                AcquireOutcome, HuddleDirectory, HuddleLease, HuddleOwnerRegistry,
+                HuddleReleaseOutcome, HuddleRenewOutcome, Ownership,
+            };
+            use buzz_core::CommunityId;
+            use buzz_relay_mesh::RuntimeId;
+            use uuid::Uuid;
+
+            // Same FakeLocalOwner as F7b: returns a fixed LocalOwner so no Redis needed.
+            struct FakeLocalOwner {
+                runtime_id: RuntimeId,
+                generation: u64,
+            }
+            #[async_trait::async_trait]
+            impl HuddleDirectory for FakeLocalOwner {
+                async fn owner_of(
+                    &self,
+                    _community_id: CommunityId,
+                    _session_id: Uuid,
+                ) -> Result<Option<Ownership>, MeshError> {
+                    Ok(Some(Ownership {
+                        owner_runtime_id: self.runtime_id,
+                        generation: self.generation,
+                    }))
+                }
+                async fn acquire(
+                    &self,
+                    _c: CommunityId,
+                    _s: Uuid,
+                    _owner: RuntimeId,
+                ) -> Result<AcquireOutcome, MeshError> {
+                    unreachable!("FakeLocalOwner: acquire must not be called on reuse arm")
+                }
+                async fn renew(
+                    &self,
+                    _lease: &HuddleLease,
+                ) -> Result<HuddleRenewOutcome, MeshError> {
+                    unreachable!("FakeLocalOwner: renew must not be called in this test")
+                }
+                async fn release(
+                    &self,
+                    _lease: &HuddleLease,
+                ) -> Result<HuddleReleaseOutcome, MeshError> {
+                    unreachable!(
+                        "FakeLocalOwner: lease release must not be called (reuse arm holds no lease)"
+                    )
+                }
+                async fn validate(
+                    &self,
+                    _c: CommunityId,
+                    _fenced: &FencedHeader,
+                ) -> Result<(), MeshError> {
+                    unreachable!("FakeLocalOwner: validate must not be called on local-owner arm")
+                }
+            }
+
+            // ── Setup ──────────────────────────────────────────────────────────
             let state = audio_test_state_real_db()
                 .await
-                .expect("Fix-B W1: PostgreSQL must be available");
+                .expect("W1+W3 handler: PostgreSQL must be available");
             let pool = state.db.pool().clone();
             let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
-            let community_id = tenant.community();
+            let community = tenant.community();
+            let tenant_host = tenant.host().to_string();
 
+            // Bob is the joiner — must be a channel member.
             let bob_key = nostr::Keys::generate();
             let bob_bytes = bob_key.public_key().to_bytes().to_vec();
             let bob_hex = bob_key.public_key().to_hex();
             buzz_db::channel_members::add_member(
                 &pool,
-                community_id,
+                community,
                 channel_id,
                 &bob_bytes,
                 buzz_db::channel_members::MemberRole::Member,
                 None,
             )
             .await
-            .expect("Fix-B W1: seed bob as member");
+            .expect("W1+W3 handler: seed bob as member");
 
-            let room = Arc::new(crate::audio::room::Room::new(community_id, channel_id));
+            // ── Build mesh with FakeLocalOwner (no Redis) ──────────────────────
+            let owners = Arc::new(HuddleOwnerRegistry::new());
+            let mesh = crate::mesh_boot::MeshHandle::for_test_only(Arc::clone(&owners)).await;
+            let runtime_id = mesh.local_runtime_id;
+            let owned_generation: u64 = 42;
+            let mesh = mesh.with_test_directory(Arc::new(FakeLocalOwner {
+                runtime_id,
+                generation: owned_generation,
+            }));
+            owners.install_for_test(channel_id, owned_generation);
+            state
+                .mesh
+                .set(mesh)
+                .map_err(|_| ())
+                .expect("W1+W3 handler: mesh OnceLock already set — state must be fresh");
 
-            // Observer: alice is already committed and subscribes to the delta channel.
+            // ── Pre-seed Alice as a committed observer ─────────────────────────
+            // The handler calls `state.audio_rooms.get_or_create(community, channel_id)`.
+            // Pre-creating the room here returns the same Arc the handler will use.
             let alice_hex = member_key.public_key().to_hex();
-            let (alice_id, ..) = room.add_peer(alice_hex, 2).expect("Fix-B W1: add alice");
+            let room = state.audio_rooms.get_or_create(community, channel_id);
+            let (alice_id, ..) = room
+                .add_peer(alice_hex.clone(), 2)
+                .expect("W1+W3 handler: add alice");
             room.mark_committed(alice_id);
-            let mut deltas = room.subscribe_roster();
-            // Drain alice's joined delta so the channel starts clean.
-            let _ = deltas.try_recv();
+            // Subscribe AFTER alice's own joined delta — drain that one noise event.
+            let mut delta_rx = room.subscribe_roster();
+            let _ = delta_rx.try_recv(); // alice's join delta is pre-existing noise
 
-            // Bob: pending slot.
-            let (bob_id, bob_index, bob_epoch, ..) = room
-                .add_peer_pending(bob_hex.clone(), 2)
-                .expect("Fix-B W1: add bob as pending");
-
-            // Pre-expire the gate: deadline in the past + cancel already fired.
-            // acquire_effect() will return SessionExpired immediately, causing rollback.
-            let past = Utc::now() - Duration::seconds(1);
-            let cancel = tokio_util::sync::CancellationToken::new();
-            cancel.cancel();
-            let gate = crate::nip_fi_gate::SessionAdmissionGate::new(past, cancel);
-
-            let result = commit_participant_join(
-                &state,
-                &tenant,
-                channel_id,
-                channel_id,
-                &bob_hex,
-                &bob_bytes,
-                bob_id,
-                bob_index,
-                bob_epoch,
-                1,
-                "1",
-                &MembershipAdmission::Existing {
-                    parent_channel_id: channel_id,
-                },
-                &gate,
-                &room,
-                None,
-            )
-            .await;
-            // Must return Expired — the gate was pre-cancelled.
-            assert!(
-                matches!(result, Err(JoinCommitError::Expired)),
-                "Fix-B W1: commit_participant_join must return Expired on pre-cancelled gate; got {result:?}"
+            // ── Wire server ────────────────────────────────────────────────────
+            let conn_cancel = tokio_util::sync::CancellationToken::new();
+            let assertion = VerifiedAssertion::for_test(
+                Some(bob_key.public_key()),
+                vec![Utc::now() + Duration::hours(1)],
             );
 
-            // The caller (handle_active_audio_connection) calls release_before_commit →
-            // remove_peer_silent on the Expired path. Simulate that here.
-            room.remove_peer_silent(bob_id);
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+            let state_c = Arc::clone(&state);
+            let tenant_c = tenant.clone();
+            let assertion_c = assertion.clone();
+            let conn_cancel_c = conn_cancel.clone();
 
-            // The delta channel must be empty — no joined AND no left for bob.
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("W1+W3 handler: bind listener");
+            let addr = listener.local_addr().expect("W1+W3 handler: local addr");
+
+            // Arm the after_add_peer hook — fires after room.add_peer_pending, before B1.
+            let (arrived_rx, release) =
+                crate::nip_fi_test_hooks::audio_add_peer_hook::arm(community);
+
+            let server = tokio::spawn(async move {
+                let app = axum::Router::new().route(
+                    "/",
+                    axum::routing::get({
+                        let state_i = Arc::clone(&state_c);
+                        let tenant_i = tenant_c.clone();
+                        let assertion_i = assertion_c.clone();
+                        let cancel_i = conn_cancel_c.clone();
+                        move |ws: axum::extract::ws::WebSocketUpgrade| {
+                            let state_i = Arc::clone(&state_i);
+                            let tenant_i = tenant_i.clone();
+                            let assertion_i = assertion_i.clone();
+                            let conn_time = chrono::Utc::now();
+                            let control_inner =
+                                crate::state::CommunityConnectionControl::new(cancel_i.clone());
+                            async move {
+                                ws.on_upgrade(move |socket| async move {
+                                    handle_active_audio_connection(
+                                        socket,
+                                        state_i,
+                                        tenant_i,
+                                        channel_id,
+                                        control_inner,
+                                        Some(assertion_i),
+                                        conn_time,
+                                        None,
+                                    )
+                                    .await
+                                })
+                            }
+                        }
+                    }),
+                );
+                let _ = ready_tx.send(());
+                axum::serve(listener, app).await.expect("test server");
+            });
+
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+                .await
+                .expect("W1+W3 handler: server ready");
+
+            let (mut client, _) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("W1+W3 handler: connect");
+
+            // Complete NIP-42 handshake.
+            let challenge_msg =
+                tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+                    .await
+                    .expect("W1+W3 handler: challenge timeout")
+                    .expect("W1+W3 handler: challenge message")
+                    .expect("W1+W3 handler: challenge ws message");
+            let challenge_text = match challenge_msg {
+                tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+                other => panic!("W1+W3 handler: expected text challenge; got {other:?}"),
+            };
+            let challenge_json: serde_json::Value =
+                serde_json::from_str(&challenge_text).expect("W1+W3 handler: challenge JSON");
+            let challenge = challenge_json["challenge"]
+                .as_str()
+                .expect("W1+W3 handler: challenge field")
+                .to_string();
+
+            let relay_url = format!("ws://{tenant_host}");
+            let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+                .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
+                .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+                .sign_with_keys(&bob_key)
+                .unwrap();
+            let auth_msg = serde_json::json!({
+                "type": "auth",
+                "event": auth_event,
+                "parent_channel_id": null,
+                "protocol_version": 2,
+            })
+            .to_string();
+            client
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    auth_msg.into(),
+                ))
+                .await
+                .expect("W1+W3 handler: send auth");
+
+            // Wait for after_add_peer — Bob is now pending in the room, B1 check is next.
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+                .await
+                .expect("W1+W3 handler: handler must reach after_add_peer within 5s")
+                .expect("W1+W3 handler: arrived channel closed");
+
+            // Verify: no delta has arrived yet (pending does not publish).
             assert!(
-                deltas.try_recv().is_err(),
-                "Fix-B W1: pending peer rollback must emit no delta of any kind\n\
+                delta_rx.try_recv().is_err(),
+                "W1+W3 handler: add_peer_pending must not emit a delta\n\
+                 Mutation oracle W1-B: swap add_peer_pending → add_peer in the handler → \
+                 joined delta fires here → try_recv succeeds → RED"
+            );
+
+            // Fire cancel — simulates mid-admission expiry at the B1 seam.
+            conn_cancel.cancel();
+
+            // Release hook — handler's B1 check fires, release_before_commit runs.
+            release.notify_one();
+
+            // Wait for the handler to complete.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.next()).await;
+
+            // ── Assert: no roster delta emitted during pending → removal path ──
+            //
+            // `guard.release_before_commit()` calls `room.remove_peer_silent(bob_id)`.
+            // That must NOT emit a delta. If it did (e.g. production uses remove_peer),
+            // the delta would be a `left` for Bob.
+            assert!(
+                delta_rx.try_recv().is_err(),
+                "W1+W3 handler: pre-commit cancel+removal must emit zero roster deltas\n\
                  Mutation oracle W1-A: change remove_peer_silent → remove_peer in \
-                 release_before_commit → left delta emitted → try_recv succeeds → RED\n\
-                 Mutation oracle W1-B: swap add_peer_pending → add_peer → joined delta \
-                 emitted at admission → try_recv succeeds → RED"
+                 production release_before_commit → left delta fires → try_recv \
+                 succeeds → RED"
             );
 
-            // Bob must be absent from the roster snapshot.
-            let snapshot = room.roster_snapshot();
-            assert!(
-                snapshot.peers.iter().all(|p| p.pubkey != bob_hex),
-                "Fix-B W1: rolled-back peer must be absent from roster snapshot; \
-                 got peers={:?}",
-                snapshot.peers.iter().map(|p| &p.pubkey).collect::<Vec<_>>()
-            );
+            // Bob must not appear in the roster snapshot.
+            let snapshot = state
+                .audio_rooms
+                .get(community, channel_id)
+                .map(|r| r.roster_snapshot());
+            if let Some(snap) = snapshot {
+                assert!(
+                    snap.peers.iter().all(|p| p.pubkey != bob_hex),
+                    "W1+W3 handler: cancelled-pending bob must be absent from roster snapshot; \
+                     got peers={:?}",
+                    snap.peers.iter().map(|p| &p.pubkey).collect::<Vec<_>>()
+                );
+            }
+
+            server.abort();
+            let _ = server.await;
         }
 
         // ── Fix-B witness W2: successful commit → delta arrives + revision ordered ─
@@ -7780,164 +8022,6 @@ mod tests {
                 delta.revision,
                 pre_bob_revision
             );
-        }
-
-        // ── Fix-B witness W3: remote failure → observer sees no joined AND no left ─
-        //
-        // This is the cross-pod rollback scenario at the `commit_participant_join`
-        // seam. An observer (Alice) in the room must receive zero delta events when
-        // Bob's pending slot is removed before `CommitConfirmed` arrives (simulated
-        // by calling `remove_peer_silent` directly after `add_peer_pending`).
-        //
-        // This is effectively a postgres-backed version of b1 that drives the real
-        // DB state and verifies the invariant holds across the full seam.
-        //
-        // ## Mutation oracle
-        //
-        // W3-A) Change `remove_peer_silent` → `remove_peer` in the pending-teardown
-        //       paths → left delta emitted → `deltas.try_recv()` succeeds → RED.
-        // W3-B) Change `add_peer_pending` → `add_peer` → joined delta emitted before
-        //       removal → `deltas.try_recv()` succeeds → RED.
-        #[tokio::test]
-        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
-        async fn fix_b_w3_remote_rollback_observer_sees_no_delta() {
-            use chrono::{Duration, Utc};
-            use std::sync::Arc;
-
-            let state = audio_test_state_real_db()
-                .await
-                .expect("Fix-B W3: PostgreSQL must be available");
-            let pool = state.db.pool().clone();
-            let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
-            let community_id = tenant.community();
-
-            let bob_key = nostr::Keys::generate();
-            let bob_bytes = bob_key.public_key().to_bytes().to_vec();
-            let bob_hex = bob_key.public_key().to_hex();
-            buzz_db::channel_members::add_member(
-                &pool,
-                community_id,
-                channel_id,
-                &bob_bytes,
-                buzz_db::channel_members::MemberRole::Member,
-                None,
-            )
-            .await
-            .expect("Fix-B W3: seed bob as member");
-
-            let room = Arc::new(crate::audio::room::Room::new(community_id, channel_id));
-
-            // Alice: observer already in the room.
-            let alice_hex = member_key.public_key().to_hex();
-            let (alice_id, ..) = room.add_peer(alice_hex, 2).expect("Fix-B W3: add alice");
-            room.mark_committed(alice_id);
-            let mut deltas = room.subscribe_roster();
-            let _ = deltas.try_recv(); // drain alice joined
-
-            // Bob: pending slot — simulates RegisterPeer arriving on the owner.
-            let (bob_id, ..) = room
-                .add_peer_pending(bob_hex.clone(), 2)
-                .expect("Fix-B W3: add bob as pending");
-
-            // No delta before anything happens.
-            assert!(
-                deltas.try_recv().is_err(),
-                "Fix-B W3: pending add must not emit a delta"
-            );
-
-            // Simulate ingress rollback: CommitConfirmed never arrives, stream
-            // closes, teardown calls remove_peer_silent on the pending slot.
-            // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
-            room.remove_peer_silent(bob_id);
-
-            // Alice (the observer) must see ZERO deltas — no joined, no left.
-            assert!(
-                deltas.try_recv().is_err(),
-                "Fix-B W3: pending-slot rollback must emit no delta to observer\n\
-                 Mutation oracle W3-A: change remove_peer_silent → remove_peer → left delta \
-                 emitted → alice try_recv succeeds → RED\n\
-                 Mutation oracle W3-B: swap add_peer_pending → add_peer → joined delta emitted \
-                 at registration → alice try_recv succeeds → RED"
-            );
-
-            // Bob must be absent from all subsequent snapshots.
-            let snapshot = room.roster_snapshot();
-            assert!(
-                snapshot.peers.iter().all(|p| p.pubkey != bob_hex),
-                "Fix-B W3: rolled-back peer must be absent from roster snapshot; \
-                 got peers={:?}",
-                snapshot.peers.iter().map(|p| &p.pubkey).collect::<Vec<_>>()
-            );
-
-            // Verify using a concurrent join: Dave joins after the rollback; his
-            // `joined` delta must not mention bob.
-            let dave_key = nostr::Keys::generate();
-            let dave_hex = dave_key.public_key().to_hex();
-            let dave_bytes = dave_key.public_key().to_bytes().to_vec();
-            buzz_db::channel_members::add_member(
-                &pool,
-                community_id,
-                channel_id,
-                &dave_bytes,
-                buzz_db::channel_members::MemberRole::Member,
-                None,
-            )
-            .await
-            .expect("Fix-B W3: seed dave");
-
-            let (dave_id, dave_index, dave_epoch, ..) = room
-                .add_peer_pending(dave_hex.clone(), 2)
-                .expect("Fix-B W3: add dave as pending");
-
-            let deadline = Utc::now() + Duration::hours(1);
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel);
-
-            commit_participant_join(
-                &state,
-                &tenant,
-                channel_id,
-                channel_id,
-                &dave_hex,
-                &dave_bytes,
-                dave_id,
-                dave_index,
-                dave_epoch,
-                1,
-                "1",
-                &MembershipAdmission::Existing {
-                    parent_channel_id: channel_id,
-                },
-                &gate,
-                &room,
-                None,
-            )
-            .await
-            .expect("Fix-B W3: dave commit must succeed");
-
-            // Alice's ctrl_rx receives Dave's joined broadcast.
-            let ctrl_msg = {
-                // drain the delta channel
-                let mut last = None;
-                loop {
-                    match deltas.try_recv() {
-                        Ok(d) => {
-                            last = Some(d);
-                        }
-                        Err(_) => break,
-                    }
-                }
-                last
-            };
-            if let Some(d) = ctrl_msg {
-                // Any delta that arrived must be Dave's joined, not Bob's.
-                if let Some(ref joined) = d.joined {
-                    assert_ne!(
-                        joined.pubkey, bob_hex,
-                        "Fix-B W3: dave's joined delta must not name the rolled-back bob"
-                    );
-                }
-            }
         }
 
         // ── end Fix-B production seam witnesses ───────────────────────────────────
