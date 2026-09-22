@@ -2116,15 +2116,13 @@ pub(crate) mod tests {
         tokio::task::yield_now().await;
         // Advance past the terminal flush timeout — the writer must exit.
         tokio::time::advance(WS_TERMINAL_FLUSH_TIMEOUT + Duration::from_millis(1)).await;
-        writer
-            .await
-            .expect(
-                "merge-integrity: writer must exit within bounded terminal flush \
+        writer.await.expect(
+            "merge-integrity: writer must exit within bounded terminal flush \
                  even when a FI denial is queued and the sink is never-ready.\n\
                  Mutation oracle: replace flush_terminal_frames in cancel arm with \
                  bare unbounded ws_send.send loop → never-ready sink blocks → \
-                 advance() does not unblock → task never exits → panic"
-            );
+                 advance() does not unblock → task never exits → panic",
+        );
     }
 
     /// Cancellation during ordinary traffic (no blocked data send, cancel fires in
@@ -2154,9 +2152,7 @@ pub(crate) mod tests {
         let denial = crate::nip_fi_session::authorization_denied_frame(
             crate::nip_fi_session::NipFiWsRoute::Root,
         );
-        terminal_ctrl_tx
-            .try_send(denial)
-            .expect("queue FI denial");
+        terminal_ctrl_tx.try_send(denial).expect("queue FI denial");
 
         let writer = tokio::spawn(send_loop_inner(
             NeverReadySink {
@@ -2174,14 +2170,12 @@ pub(crate) mod tests {
         cancel.cancel();
         tokio::task::yield_now().await;
         tokio::time::advance(WS_TERMINAL_FLUSH_TIMEOUT + Duration::from_millis(1)).await;
-        writer
-            .await
-            .expect(
-                "merge-integrity: writer must exit from select! cancel arm within bounded flush.\n\
+        writer.await.expect(
+            "merge-integrity: writer must exit from select! cancel arm within bounded flush.\n\
                  Mutation oracle: remove &mut terminal_ctrl_rx from flush_terminal_frames in \
                  the cancel.cancelled() arm → denial skipped → for never-ready sink, \
-                 flush_terminal_frames still times out, but the terminal drain path is absent"
-            );
+                 flush_terminal_frames still times out, but the terminal drain path is absent",
+        );
     }
 
     #[tokio::test]

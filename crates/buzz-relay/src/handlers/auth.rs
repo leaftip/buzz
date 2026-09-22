@@ -1121,8 +1121,7 @@ mod tests {
                 .try_recv()
                 .expect("Fix 4a: canonical denial must be on terminal_ctrl_rx");
             assert_eq!(
-                terminal_frame,
-                expected_frame,
+                terminal_frame, expected_frame,
                 "Fix 4a: terminal frame must be the exact canonical authorization_denied_frame"
             );
             // Cancel must have fired — connection terminates.
