@@ -298,3 +298,33 @@ pub(crate) fn before_event_publish(community: CommunityId) {
 //      hook fires after the irreversible side effect; expired gate
 //      can no longer prevent delivery → publication counter shows 1 → panics.
 make_hook!(observer_publication_hook, before_observer_publication);
+
+// ── F4: add-peer gate-acquire hook ────────────────────────────────────────
+// `before_add_peer_gate_acquire`: fires in `handle_active_audio_connection`
+// immediately before `audio_gate.acquire_effect()` in Step 5 (add-peer).
+// After auth + membership pass, the handler reaches this hook just before the
+// gate acquire that may return `SessionExpired`.
+//
+// F4 add-peer test arms this hook, awaits arrival (handler at the gate),
+// then expires the gate manually (`gate.expire()` or via cancellation).
+// Releases the hook → handler resumes → `acquire_effect()` returns
+// `SessionExpired` → handler calls `expiry_deny_terminal` + R2 drain +
+// sends denial frame + close.  The WS client then observes:
+//   frame 0: restricted JSON (Audio authorization-denied payload)
+//   frame 1: 1008 POLICY close
+//
+// Removing `expiry_deny_terminal` from the `SessionExpired` arm makes frame 0
+// either absent or a close-only, which breaks the frame-0 equality assertion.
+// Removing R2 drain makes frame 0 absent (denial queued but never drained).
+//
+// Mutation evidence:
+//   A) Remove `expiry_deny_terminal` from the add-peer SessionExpired arm →
+//      frame 0 is not the denial JSON → wire assertion panics.
+//   B) Remove R2 drain (`while let Ok(msg) = terminal_ctrl_rx.try_recv()`) →
+//      denial queued but never sent → frame 0 is missing → timeout panics.
+//   C) Delete `before_add_peer_gate_acquire(...)` from handler →
+//      arrived_rx times out → test panics (proves hook is at the right seam).
+make_hook!(
+    audio_add_peer_gate_acquire_hook,
+    before_add_peer_gate_acquire
+);

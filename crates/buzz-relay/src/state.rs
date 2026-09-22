@@ -4714,15 +4714,28 @@ pub(crate) mod tests {
                      mutation: manager_disconnect_nip_fi hook path never reached",
             );
 
-        // FIXED: lifecycle_cancel acquires the lock — blocks until manager drops
-        // it after try_send, so the consumer never sees an empty channel.
-        // MUTATION: lifecycle_cancel calls cancel.cancel() without the lock —
-        // consumer wakes before manager's try_send, sees Err(Empty).
-        control.lifecycle_cancel();
+        // F7 fix: spawn lifecycle_cancel on an independent worker so the main
+        // thread remains free to send `proceed` to the hook.  lifecycle_cancel
+        // blocks on the transition lock (held by manager) — this is what we are
+        // proving.  Calling it directly on main while the hook holds the lock
+        // waiting for main's proceed creates a circular wait.
+        let control_for_lc = control.clone();
+        let lc_thread = std::thread::spawn(move || {
+            // FIXED: lifecycle_cancel acquires the lock — blocks until manager
+            // drops it after try_send, so the consumer never sees an empty
+            // channel.
+            // MUTATION: lifecycle_cancel calls cancel.cancel() without the lock
+            // — consumer wakes before manager's try_send, sees Err(Empty).
+            control_for_lc.lifecycle_cancel();
+        });
 
-        // Allow the hook to proceed (manager's try_send can now complete).
+        // Allow the hook to proceed (manager's try_send can now complete,
+        // then drops the lock so lifecycle_cancel can acquire it).
         hook_proceed_tx.send(()).unwrap();
 
+        lc_thread
+            .join()
+            .expect("W_lifecycle_cancel_race: lifecycle_cancel thread panicked");
         manager_thread
             .join()
             .expect("W_lifecycle_cancel_race: manager thread panicked");
@@ -4859,15 +4872,28 @@ pub(crate) mod tests {
                      mutation: manager_disconnect_nip_fi hook path never reached",
             );
 
-        // FIXED: lifecycle_cancel acquires the lock → blocks until deny's try_send
-        // completes → consumer always sees the frame.
-        // MUTATION: lifecycle_cancel calls cancel.cancel() bare → fires before
-        // deny's try_send → consumer wakes on empty terminal channel → RED.
-        mgr.drain_all();
+        // F7 fix: spawn drain_all on an independent worker so the main thread
+        // remains free to send `proceed` to the hook.  drain_all calls
+        // lifecycle_cancel which blocks on the transition lock (held by the deny
+        // thread) — this is what we are proving.  Calling drain_all directly on
+        // main while the hook holds the lock waiting for main's proceed creates a
+        // circular wait.
+        let mgr_for_drain = Arc::clone(&mgr);
+        let drain_thread = std::thread::spawn(move || {
+            // FIXED: lifecycle_cancel acquires the lock → blocks until deny's
+            // try_send completes → consumer always sees the frame.
+            // MUTATION: lifecycle_cancel calls cancel.cancel() bare → fires
+            // before deny's try_send → consumer wakes on empty terminal channel.
+            mgr_for_drain.drain_all();
+        });
 
-        // Allow the hook to proceed.
+        // Allow the hook to proceed (deny's try_send can now complete, then
+        // drops the lock so drain_all's lifecycle_cancel can acquire it).
         hook_proceed_tx.send(()).unwrap();
 
+        drain_thread
+            .join()
+            .expect("W_root_manager_drain_race: drain_all thread panicked");
         deny_thread
             .join()
             .expect("W_root_manager_drain_race: deny thread panicked");
@@ -4995,15 +5021,28 @@ pub(crate) mod tests {
                      mutation: disconnect_nip_fi hook path never reached",
             );
 
-        // FIXED: lifecycle_cancel acquires the lock → blocks until deny's try_send
-        // completes → consumer always sees the frame.
-        // MUTATION: lifecycle_cancel calls cancel.cancel() bare → audio teardown
-        // fires cancel before deny's try_send → consumer sees Err(Empty) → RED.
-        control.lifecycle_cancel();
+        // F7 fix: spawn lifecycle_cancel on an independent worker so the main
+        // thread remains free to send `proceed` to the hook.  lifecycle_cancel
+        // blocks on the transition lock (held by the deny thread) — this is
+        // what we are proving.  Calling it directly on main while the hook
+        // holds the lock waiting for main's proceed creates a circular wait.
+        let control_for_lc = control.clone();
+        let lc_thread = std::thread::spawn(move || {
+            // FIXED: lifecycle_cancel acquires the lock → blocks until deny's
+            // try_send completes → consumer always sees the frame.
+            // MUTATION: lifecycle_cancel calls cancel.cancel() bare → audio
+            // teardown fires cancel before deny's try_send → consumer sees
+            // Err(Empty) → RED.
+            control_for_lc.lifecycle_cancel();
+        });
 
-        // Allow the hook to proceed.
+        // Allow the hook to proceed (deny's try_send can now complete, then
+        // drops the lock so lifecycle_cancel can acquire it).
         hook_proceed_tx.send(()).unwrap();
 
+        lc_thread
+            .join()
+            .expect("W_audio_registry_lifecycle_cancel_race: lifecycle_cancel thread panicked");
         deny_thread
             .join()
             .expect("W_audio_registry_lifecycle_cancel_race: deny thread panicked");

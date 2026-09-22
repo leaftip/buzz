@@ -427,9 +427,11 @@ fn parse_u64_bounded(var: &str, min: u64, max: u64) -> Result<Option<u64>, Confi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Use the crate-wide env-var serialization mutex so NIP-FI env-mutation
+    // tests here serialize against Config::from_env callers in config.rs and
+    // api/gifs.rs (which also call from_env in the same process).  [F6]
+    use crate::config::ENV_TEST_MUTEX as ENV_LOCK;
 
     /// RAII guard: removes env vars on drop to keep tests isolated.
     struct EnvGuard(Vec<&'static str>);

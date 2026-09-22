@@ -944,6 +944,13 @@ pub(crate) async fn handle_active_audio_connection(
     // create a peer without winning the gate, so the committed/peer-absent
     // invariant holds across deadline-exact races at this seam too.
     let add_peer_result = {
+        // Test hook: fires immediately before audio_gate.acquire_effect() in
+        // Step 5.  Used by F4 add-peer witness: arms this hook, waits for
+        // arrival (handler at the gate seam), then expires the gate so
+        // acquire_effect() returns SessionExpired on release.  No-op in
+        // production.  [nip_fi_test_hooks::audio_add_peer_gate_acquire_hook, F4]
+        #[cfg(test)]
+        crate::nip_fi_test_hooks::before_add_peer_gate_acquire(tenant.community()).await;
         let _add_permit = match audio_gate.acquire_effect().await {
             Ok(p) => p,
             Err(crate::nip_fi_gate::SessionExpired) => {
@@ -1013,6 +1020,16 @@ pub(crate) async fn handle_active_audio_connection(
                     let _ = t.await;
                 }
                 guard.release_before_commit().await;
+                // R2: deliver any already-winning denial frame + close before
+                // dropping the socket.  The send_loop is not yet started so
+                // ws_send is directly owned here.  [FI-INV-05, R2 fix]
+                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                    let _ = ws_send.send(msg).await;
+                }
+                let nip_fi_close_reason = *disconnect_reason.borrow();
+                if let Some(reason) = nip_fi_close_reason {
+                    let _ = ws_send.send(reason.close_message()).await;
+                }
                 return;
             }
             Err(crate::audio::room::AdmissionError::Ended) => {
@@ -1025,6 +1042,14 @@ pub(crate) async fn handle_active_audio_connection(
                     let _ = t.await;
                 }
                 guard.release_before_commit().await;
+                // R2: deliver any already-winning denial frame + close. [FI-INV-05, R2 fix]
+                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                    let _ = ws_send.send(msg).await;
+                }
+                let nip_fi_close_reason = *disconnect_reason.borrow();
+                if let Some(reason) = nip_fi_close_reason {
+                    let _ = ws_send.send(reason.close_message()).await;
+                }
                 return;
             }
             Err(crate::audio::room::AdmissionError::VersionMismatch { pinned, requested }) => {
@@ -1041,6 +1066,14 @@ pub(crate) async fn handle_active_audio_connection(
                     let _ = t.await;
                 }
                 guard.release_before_commit().await;
+                // R2: deliver any already-winning denial frame + close. [FI-INV-05, R2 fix]
+                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                    let _ = ws_send.send(msg).await;
+                }
+                let nip_fi_close_reason = *disconnect_reason.borrow();
+                if let Some(reason) = nip_fi_close_reason {
+                    let _ = ws_send.send(reason.close_message()).await;
+                }
                 return;
             }
         };
@@ -1326,6 +1359,14 @@ pub(crate) async fn handle_active_audio_connection(
                         .into(),
                 ))
                 .await;
+            // R2: deliver any already-winning denial frame + close. [FI-INV-05, R2 fix]
+            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                let _ = ws_send.send(msg).await;
+            }
+            let nip_fi_close_reason = *disconnect_reason.borrow();
+            if let Some(reason) = nip_fi_close_reason {
+                let _ = ws_send.send(reason.close_message()).await;
+            }
             return;
         }
         Err(JoinCommitError::ParentMembershipLost) => {
@@ -1347,6 +1388,14 @@ pub(crate) async fn handle_active_audio_connection(
                         .into(),
                 ))
                 .await;
+            // R2: deliver any already-winning denial frame + close. [FI-INV-05, R2 fix]
+            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                let _ = ws_send.send(msg).await;
+            }
+            let nip_fi_close_reason = *disconnect_reason.borrow();
+            if let Some(reason) = nip_fi_close_reason {
+                let _ = ws_send.send(reason.close_message()).await;
+            }
             return;
         }
         Err(JoinCommitError::HuddleLinkGone) => {
@@ -1369,6 +1418,14 @@ pub(crate) async fn handle_active_audio_connection(
                         .into(),
                 ))
                 .await;
+            // R2: deliver any already-winning denial frame + close. [FI-INV-05, R2 fix]
+            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                let _ = ws_send.send(msg).await;
+            }
+            let nip_fi_close_reason = *disconnect_reason.borrow();
+            if let Some(reason) = nip_fi_close_reason {
+                let _ = ws_send.send(reason.close_message()).await;
+            }
             return;
         }
         Err(JoinCommitError::Db(e)) => {
@@ -1390,6 +1447,14 @@ pub(crate) async fn handle_active_audio_connection(
                         .into(),
                 ))
                 .await;
+            // R2: deliver any already-winning denial frame + close. [FI-INV-05, R2 fix]
+            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                let _ = ws_send.send(msg).await;
+            }
+            let nip_fi_close_reason = *disconnect_reason.borrow();
+            if let Some(reason) = nip_fi_close_reason {
+                let _ = ws_send.send(reason.close_message()).await;
+            }
             return;
         }
     }
@@ -5102,13 +5167,44 @@ mod tests {
 
     /// Create an AppState backed by the real local DB.
     ///
-    /// Returns `None` if the DB at 127.0.0.1:5432 is not reachable.
+    /// URL priority: `BUZZ_TEST_DATABASE_URL` → `TEST_DATABASE_URL` → `DATABASE_URL`
+    /// → fallback to `postgres://buzz:buzz_dev@127.0.0.1:5432/buzz` for local dev.
+    ///
+    /// In CI the PostgreSQL test wrapper exports one of the first three env vars
+    /// pointing to an isolated database; the fallback is for local development
+    /// where the developer runs a local Postgres instance.
+    ///
+    /// Panics with a clear diagnostic if a wrapper env var is set but the DB is
+    /// unreachable (CI misconfiguration is never silently skipped).
+    /// Returns `None` only when no env var is set AND the fallback URL is not
+    /// reachable (dev box without a local Postgres).  [F3 fix]
     async fn audio_test_state_real_db() -> Option<std::sync::Arc<crate::state::AppState>> {
         use std::sync::Arc;
-        let db_url = "postgres://buzz:buzz_dev@127.0.0.1:5432/buzz";
-        if sqlx::PgPool::connect(db_url).await.is_err() {
-            return None;
-        }
+
+        // Resolve DB URL: CI wrapper envs take precedence, fallback for local dev.
+        let wrapper_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok();
+        let fallback = "postgres://buzz:buzz_dev@127.0.0.1:5432/buzz";
+
+        let db_url = if let Some(ref url) = wrapper_url {
+            // CI path: wrapper provided an isolated DB URL.  Failure is a hard
+            // error — silently skipping would hide CI misconfiguration.
+            sqlx::PgPool::connect(url).await.unwrap_or_else(|e| {
+                panic!(
+                    "F3: BUZZ_TEST_DATABASE_URL/TEST_DATABASE_URL/DATABASE_URL is set \
+                     to {url} but the DB is unreachable: {e}"
+                )
+            });
+            url.as_str()
+        } else {
+            // Local dev path: probe the well-known dev URL and skip gracefully.
+            if sqlx::PgPool::connect(fallback).await.is_err() {
+                return None;
+            }
+            fallback
+        };
         // hermetic_for_test: env-free, never races NIP-FI env-var mutations.
         // Override database_url to the live local DB probed above. [F6]
         let mut config = crate::config::Config::hermetic_for_test();
@@ -7285,6 +7381,413 @@ mod tests {
         );
     }
 
+    // ── F4: add-peer gate-expired → denial frame delivered before close (handler-bound) ──
+    //
+    // Production path: `handle_active_audio_connection`, Step 5, line ~959:
+    //   `audio_gate.acquire_effect()` → Err(SessionExpired)
+    //   → control.expiry_deny_terminal(...)   ← PROOF SEAM: must be present
+    //   → lifecycle_cancel
+    //   → R2 drain (while let Ok(msg) = terminal_ctrl_rx.try_recv())
+    //   → ws_send.send(denial frame)
+    //   → ws_send.send(close frame)
+    //   → return
+    //
+    // The test arms `before_add_peer_gate_acquire` to intercept the handler
+    // just before `audio_gate.acquire_effect()` (Step 5), then cancels the
+    // connection token (simulating late-firing expiry), then releases the
+    // hook.  `acquire_effect()` immediately returns `SessionExpired`, the
+    // handler's denial arm runs, and the WS client observes:
+    //   frame 0: Audio restricted JSON payload
+    //   frame 1: 1008 POLICY close
+    //
+    // Mutation evidence:
+    //   A) Remove `expiry_deny_terminal` from the add-peer SessionExpired arm →
+    //      no denial frame queued → R2 drain finds empty channel → frame 0
+    //      is the POLICY close instead of the JSON payload → frame-0 text
+    //      assertion panics.
+    //   B) Remove R2 drain → denial queued but never drained → frame 0 absent
+    //      → timeout panics.
+    //   C) Remove `before_add_peer_gate_acquire` hook call from handler →
+    //      arrived_rx never fires → test panics before any assertion.
+    //   D) Delete `#[cfg(test)] before_add_peer_gate_acquire(...)` line →
+    //      same as C.
+    //
+    // Requires Postgres for `seed_audio_fixture` (channel/member row).
+    async fn f4_add_peer_expired_delivers_denial_before_close_body() {
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+        use tokio_tungstenite::connect_async;
+
+        let state = audio_test_state_real_db().await.expect(
+            "F4 add-peer: DB must be available (test is marked #[ignore = \"requires Postgres\"])",
+        );
+        let pool = state.db.pool().clone();
+        let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
+        let community_id = tenant.community();
+
+        // Assertion: matching key, far-future deadline so the gate does NOT
+        // self-expire before the test intercepts at the hook.  The test will
+        // cancel from outside.
+        let assertion = VerifiedAssertion::for_test(
+            Some(member_key.public_key()),
+            vec![Utc::now() + Duration::hours(1)],
+        );
+
+        let conn_cancel = CancellationToken::new();
+        let cancel_for_test = conn_cancel.clone();
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+        let cancel_c = conn_cancel.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("F4 add-peer: bind test listener");
+        let addr = listener.local_addr().expect("F4 add-peer: listener addr");
+
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/",
+                get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    let cancel_i = cancel_c.clone();
+                    move |ws: WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let cancel_i = cancel_i.clone();
+                        let conn_time = chrono::Utc::now();
+                        let control_i =
+                            crate::state::CommunityConnectionControl::new(cancel_i.clone());
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    channel_id,
+                                    control_i,
+                                    Some(assertion_i),
+                                    conn_time,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app)
+                .await
+                .expect("F4 add-peer: test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("F4 add-peer: server ready");
+
+        // Arm the hook BEFORE connecting so we capture the handler at the exact seam.
+        let (arrived_rx, hook_release) =
+            crate::nip_fi_test_hooks::audio_add_peer_gate_acquire_hook::arm(community_id);
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("F4 add-peer: connect client");
+
+        // NIP-42 auth exchange.
+        let challenge_msg = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("F4 add-peer: challenge timeout")
+            .expect("F4 add-peer: challenge item")
+            .expect("F4 add-peer: challenge message");
+        let challenge_text = match challenge_msg {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("F4 add-peer: expected text challenge; got {other:?}"),
+        };
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&challenge_text).expect("F4 add-peer: challenge JSON");
+        let challenge = challenge_json["challenge"]
+            .as_str()
+            .expect("F4 add-peer: challenge field")
+            .to_string();
+
+        let relay_url = "ws://test.local";
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&member_key)
+            .unwrap();
+        let auth_msg = serde_json::json!({"type": "auth", "event": auth_event}).to_string();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                auth_msg.into(),
+            ))
+            .await
+            .expect("F4 add-peer: send auth");
+
+        // Wait for handler to reach before_add_peer_gate_acquire.
+        // Handler has done: auth → membership check → channel DB reads → step 5 seam.
+        tokio::time::timeout(std::time::Duration::from_secs(10), arrived_rx)
+            .await
+            .expect("F4 add-peer: handler must reach before_add_peer_gate_acquire within 10s")
+            .expect("F4 add-peer: hook arrived channel closed");
+
+        // Cancel from test side: simulates late-firing expiry (deadline elapsed
+        // between auth and add-peer).  acquire_effect() will return SessionExpired.
+        cancel_for_test.cancel();
+
+        // Release the hook: handler resumes → acquire_effect() → SessionExpired
+        // → expiry_deny_terminal → lifecycle_cancel → R2 drain → send frames.
+        hook_release.notify_one();
+
+        // Frame 0: Audio authorization-denied JSON payload.
+        let frame0 = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .expect("F4 add-peer: frame 0 timeout")
+            .expect("F4 add-peer: frame 0 item")
+            .expect("F4 add-peer: frame 0 message");
+        let expected_restricted = serde_json::json!({
+            "type": "restricted",
+            "message": buzz_auth::DenialClass::AuthorizationDenied.nostr_text()
+        })
+        .to_string();
+        match &frame0 {
+            tokio_tungstenite::tungstenite::Message::Text(t) => assert_eq!(
+                t.as_str(),
+                expected_restricted.as_str(),
+                "F4 add-peer: frame 0 must be exact canonical Audio restricted JSON \
+                 (proves expiry_deny_terminal ran in the handler's SessionExpired arm)"
+            ),
+            other => panic!("F4 add-peer: frame 0 must be Text(restricted JSON); got {other:?}"),
+        }
+
+        // Frame 1: 1008 POLICY close.
+        let frame1 = tokio::time::timeout(std::time::Duration::from_secs(3), client.next())
+            .await
+            .expect("F4 add-peer: frame 1 timeout")
+            .expect("F4 add-peer: frame 1 item")
+            .expect("F4 add-peer: frame 1 message");
+        match &frame1 {
+            tokio_tungstenite::tungstenite::Message::Close(Some(cf)) => {
+                assert_eq!(
+                    cf.code,
+                    tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                    "F4 add-peer: close code must be 1008 POLICY; got {:?}",
+                    cf.code
+                );
+            }
+            other => panic!("F4 add-peer: frame 1 must be Close(Some(1008)); got {other:?}"),
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    // ── F4: commit gate-expired → denial frame delivered before close (handler-bound) ──
+    //
+    // Production path: `handle_active_audio_connection`, commit match arm, line ~1306:
+    //   `commit_participant_join(...)` → Err(JoinCommitError::Expired)
+    //   → control.expiry_deny_terminal(...)   ← PROOF SEAM: must be present
+    //   → lifecycle_cancel
+    //   → R2 drain (while let Ok(msg) = terminal_ctrl_rx.try_recv())
+    //   → ws_send.send(denial frame)
+    //   → ws_send.send(close frame)
+    //   → return
+    //
+    // Uses `before_participant_commit` (already in `nip_fi_test_hooks`) which fires
+    // inside `commit_participant_join` BEFORE `acquire_effect()`.  Test arms the hook,
+    // waits for arrival (handler at the commit gate seam), cancels from test side,
+    // releases hook → `commit_participant_join` returns `Err(JoinCommitError::Expired)`
+    // → handler's Expired arm runs → wire delivers denial + close.
+    //
+    // Mutation evidence:
+    //   A) Remove `expiry_deny_terminal` from the JoinCommitError::Expired arm →
+    //      no denial frame queued → R2 drain finds empty channel → frame 0 is
+    //      the POLICY close → frame-0 text assertion panics.
+    //   B) Remove R2 drain → denial queued but never drained → timeout panics.
+    //   C) Delete `before_participant_commit(...)` call from commit_participant_join →
+    //      arrived_rx never fires → test panics.
+    //
+    // Requires Postgres for DB writes in the commit path.
+    async fn f4_commit_expired_delivers_denial_before_close_body() {
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+        use tokio_tungstenite::connect_async;
+
+        let state = audio_test_state_real_db().await.expect(
+            "F4 commit: DB must be available (test is marked #[ignore = \"requires Postgres\"])",
+        );
+        let pool = state.db.pool().clone();
+        let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
+        let community_id = tenant.community();
+
+        // Far-future deadline: the expiry task will not self-fire; we cancel manually.
+        let assertion = VerifiedAssertion::for_test(
+            Some(member_key.public_key()),
+            vec![Utc::now() + Duration::hours(1)],
+        );
+
+        let conn_cancel = CancellationToken::new();
+        let cancel_for_test = conn_cancel.clone();
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+        let cancel_c = conn_cancel.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("F4 commit: bind test listener");
+        let addr = listener.local_addr().expect("F4 commit: listener addr");
+
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/",
+                get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    let cancel_i = cancel_c.clone();
+                    move |ws: WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let cancel_i = cancel_i.clone();
+                        let conn_time = chrono::Utc::now();
+                        let control_i =
+                            crate::state::CommunityConnectionControl::new(cancel_i.clone());
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    channel_id,
+                                    control_i,
+                                    Some(assertion_i),
+                                    conn_time,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app)
+                .await
+                .expect("F4 commit: test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("F4 commit: server ready");
+
+        // Arm `before_participant_commit`: fires inside commit_participant_join
+        // BEFORE acquire_effect().  This intercepts the handler at the commit seam.
+        let (arrived_rx, hook_release) =
+            crate::nip_fi_test_hooks::audio_participant_commit_hook::arm(community_id);
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("F4 commit: connect client");
+
+        // NIP-42 auth exchange.
+        let challenge_msg = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("F4 commit: challenge timeout")
+            .expect("F4 commit: challenge item")
+            .expect("F4 commit: challenge message");
+        let challenge_text = match challenge_msg {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("F4 commit: expected text challenge; got {other:?}"),
+        };
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&challenge_text).expect("F4 commit: challenge JSON");
+        let challenge = challenge_json["challenge"]
+            .as_str()
+            .expect("F4 commit: challenge field")
+            .to_string();
+
+        let relay_url = "ws://test.local";
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&member_key)
+            .unwrap();
+        let auth_msg = serde_json::json!({"type": "auth", "event": auth_event}).to_string();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                auth_msg.into(),
+            ))
+            .await
+            .expect("F4 commit: send auth");
+
+        // Wait for handler to reach before_participant_commit.
+        // Handler has done: auth → membership → add_peer → 48101 insert → commit seam.
+        tokio::time::timeout(std::time::Duration::from_secs(15), arrived_rx)
+            .await
+            .expect("F4 commit: handler must reach before_participant_commit within 15s")
+            .expect("F4 commit: hook arrived channel closed");
+
+        // Cancel from test side.
+        cancel_for_test.cancel();
+
+        // Release: commit_participant_join returns Err(JoinCommitError::Expired).
+        // Handler's Expired arm: expiry_deny_terminal → lifecycle_cancel → R2 drain
+        // → send denial frame + close.
+        hook_release.notify_one();
+
+        // Frame 0: Audio authorization-denied JSON payload.
+        let frame0 = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .expect("F4 commit: frame 0 timeout")
+            .expect("F4 commit: frame 0 item")
+            .expect("F4 commit: frame 0 message");
+        let expected_restricted = serde_json::json!({
+            "type": "restricted",
+            "message": buzz_auth::DenialClass::AuthorizationDenied.nostr_text()
+        })
+        .to_string();
+        match &frame0 {
+            tokio_tungstenite::tungstenite::Message::Text(t) => assert_eq!(
+                t.as_str(),
+                expected_restricted.as_str(),
+                "F4 commit: frame 0 must be exact canonical Audio restricted JSON \
+                 (proves expiry_deny_terminal ran in the handler's JoinCommitError::Expired arm)"
+            ),
+            other => panic!("F4 commit: frame 0 must be Text(restricted JSON); got {other:?}"),
+        }
+
+        // Frame 1: 1008 POLICY close.
+        let frame1 = tokio::time::timeout(std::time::Duration::from_secs(3), client.next())
+            .await
+            .expect("F4 commit: frame 1 timeout")
+            .expect("F4 commit: frame 1 item")
+            .expect("F4 commit: frame 1 message");
+        match &frame1 {
+            tokio_tungstenite::tungstenite::Message::Close(Some(cf)) => {
+                assert_eq!(
+                    cf.code,
+                    tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                    "F4 commit: close code must be 1008 POLICY; got {:?}",
+                    cf.code
+                );
+            }
+            other => panic!("F4 commit: frame 1 must be Close(Some(1008)); got {other:?}"),
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
+
     mod postgres_tests {
         /// F3: lifecycle_generation committed in kind-48101 JOIN matches the relay's
         /// global liveness generation (the same value `handle_huddle_liveness_req`
@@ -7296,6 +7799,28 @@ mod tests {
         #[ignore = "requires Postgres"]
         async fn f3_commit_participant_join_includes_lifecycle_generation() {
             super::f3_commit_participant_join_includes_lifecycle_generation_body().await;
+        }
+
+        /// F4 (add-peer path): handler's `SessionExpired` arm at `audio_gate.acquire_effect()`
+        /// in Step 5 calls `expiry_deny_terminal` and delivers the Audio denial frame +
+        /// 1008 POLICY close before the socket drops.  Exercised via the full handler.
+        ///
+        /// Discoverable by the PostgreSQL Tests CI lane (requires `seed_audio_fixture` DB writes).
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn f4_add_peer_expired_delivers_denial_before_close() {
+            super::f4_add_peer_expired_delivers_denial_before_close_body().await;
+        }
+
+        /// F4 (commit path): handler's `JoinCommitError::Expired` arm calls `expiry_deny_terminal`
+        /// and delivers the Audio denial frame + 1008 POLICY close before the socket drops.
+        /// Exercised via the full handler with `before_participant_commit` hook.
+        ///
+        /// Discoverable by the PostgreSQL Tests CI lane (requires full DB commit path).
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn f4_commit_expired_delivers_denial_before_close() {
+            super::f4_commit_expired_delivers_denial_before_close_body().await;
         }
     }
 }

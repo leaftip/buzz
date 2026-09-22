@@ -482,17 +482,23 @@ mod tests {
 
     #[tokio::test]
     async fn w_f4_add_peer_rejection_wire_delivers_denial_before_cancel() {
-        // Production add-peer rejection sequence (audio/handler.rs SessionExpired arm):
-        //   1. gate.acquire_effect() → Err(SessionExpired)     [wall-clock path]
-        //   2. control.expiry_deny_terminal(&terminal_ctrl_tx, Audio)
-        //   3. control.lifecycle_cancel()
-        //   4. expiry_task.await
+        // Primitive-level ordering proof for the add-peer rejection sequence.
         //
-        // Binding: uses a real gate (past deadline → acquire_effect returns
-        // SessionExpired) and a real spawned expiry task (far-future deadline —
-        // task is in its sleep arm, not yet fired).  The task's cancel arm runs
-        // quiesce() (not expiry_deny_terminal), so the denial frame must come
-        // from step 2 above.
+        // What this proves: when `expiry_deny_terminal` runs BEFORE `lifecycle_cancel`,
+        // the terminal channel is populated before any cancel wakes a consumer.
+        //
+        // Production path (audio/handler.rs SessionExpired arm, line ~959):
+        //   1. acquire_effect() → Err(SessionExpired)
+        //   2. control.expiry_deny_terminal(&terminal_ctrl_tx, Audio)  ← this call
+        //   3. control.lifecycle_cancel()
+        //
+        // This test calls `expiry_deny_terminal` directly (same call as the handler).
+        // Mutation within this test:
+        //   Reorder steps 2 and 3 (call lifecycle_cancel before expiry_deny_terminal)
+        //   → consumer wakes on empty channel → try_recv returns Err → assertion panics.
+        //
+        // Handler-bound wire delivery is proven in
+        //   `postgres_tests::f4_add_peer_expired_delivers_denial_before_close`.
         let (terminal_tx, mut terminal_rx) = tokio::sync::mpsc::channel::<WsMessage>(1);
         let cancel = CancellationToken::new();
         let control = crate::state::CommunityConnectionControl::new(cancel.clone());
@@ -530,7 +536,7 @@ mod tests {
         let frame = terminal_rx.try_recv().expect(
             "W_f4_add_peer: denial frame must be in terminal channel after expiry_deny_terminal \
              and before lifecycle_cancel (proves rejection path enqueues before self-cancel). \
-             Mutation: remove expiry_deny_terminal from audio/handler.rs → this panics.",
+             Mutation: reorder steps 2 and 3 → cancel fires first → Err(Empty) → RED.",
         );
         let expected = authorization_denied_frame(NipFiWsRoute::Audio);
         assert_eq!(
@@ -566,12 +572,22 @@ mod tests {
 
     #[tokio::test]
     async fn w_f4_commit_rejection_wire_delivers_denial_before_cancel() {
-        // Production commit rejection sequence (audio/handler.rs JoinCommitError::Expired arm):
-        //   Same ordering as add-peer but reached via the commit path.  Separate
-        //   witness so both code paths are independently proven to call
-        //   expiry_deny_terminal before self-cancelling.
+        // Primitive-level ordering proof for the commit rejection sequence.
         //
-        // Binding and mutation evidence: identical to w_f4_add_peer.
+        // What this proves: when `expiry_deny_terminal` runs BEFORE `lifecycle_cancel`,
+        // the terminal channel is populated before any cancel wakes a consumer.
+        //
+        // Production path (audio/handler.rs JoinCommitError::Expired arm, line ~1306):
+        //   1. commit_participant_join() → Err(JoinCommitError::Expired)
+        //   2. control.expiry_deny_terminal(&terminal_ctrl_tx, Audio)  ← this call
+        //   3. control.lifecycle_cancel()
+        //
+        // This test calls `expiry_deny_terminal` directly (same call as the handler).
+        // Mutation within this test:
+        //   Reorder steps 2 and 3 → cancel fires first → try_recv returns Err → RED.
+        //
+        // Handler-bound wire delivery is proven in
+        //   `postgres_tests::f4_commit_expired_delivers_denial_before_close`.
         let (terminal_tx, mut terminal_rx) = tokio::sync::mpsc::channel::<WsMessage>(1);
         let cancel = CancellationToken::new();
         let control = crate::state::CommunityConnectionControl::new(cancel.clone());
@@ -603,7 +619,7 @@ mod tests {
         let frame = terminal_rx.try_recv().expect(
             "W_f4_commit: denial frame must be in terminal channel after expiry_deny_terminal \
              and before lifecycle_cancel (proves commit rejection enqueues before self-cancel). \
-             Mutation: remove expiry_deny_terminal from audio/handler.rs → this panics.",
+             Mutation: reorder steps 2 and 3 → cancel fires first → Err(Empty) → RED.",
         );
         let expected = authorization_denied_frame(NipFiWsRoute::Audio);
         assert_eq!(
@@ -786,17 +802,18 @@ mod tests {
              registry.disconnect_nip_fi (admin path enqueues before cancel). \
              Mutation A: remove set_terminal_frame_sender → frame absent → this panics.",
         );
-        let expected = authorization_denied_frame(NipFiWsRoute::Root);
+        let expected = authorization_denied_frame(NipFiWsRoute::Audio);
         assert_eq!(
             frame, expected,
-            "W_f5_registry: queued frame must be the canonical Root authorization-denied frame"
+            "W_f5_registry: queued frame must be the canonical Audio authorization-denied frame \
+             (CommunityConnectionControl::disconnect_nip_fi hard-codes NipFiWsRoute::Audio)"
         );
 
         // Task is now in its cancel arm, blocked in quiesce() — the held permit
-        // prevents the write guard acquisition.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        // prevents the write guard acquisition.  Use a bounded sleep as a window
+        // to observe the blocked state (not a spin — a real time bound proves the
+        // permit is held long enough for quiesce to reach the wait point).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             !task_handle.is_finished(),
             "W_f5_registry: expiry task must not finish while a permit is still held \

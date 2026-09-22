@@ -1398,6 +1398,15 @@ impl Config {
     }
 }
 
+/// Process-wide mutex for tests that mutate environment variables.
+///
+/// All test modules that read OR write environment variables (directly via
+/// `std::env::set_var`/`remove_var` or indirectly via `Config::from_env`)
+/// must hold this mutex for the duration of the test to prevent same-process
+/// parallel mutation races.  [F6: env-var serialization across crate modules]
+#[cfg(test)]
+pub(crate) static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1438,7 +1447,10 @@ mod tests {
     // Mutex to serialize tests that mutate environment variables.
     // Parallel env-var mutation causes `defaults_are_valid` to see the invalid
     // value set by `invalid_bind_addr_returns_error`, causing a flaky failure.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // This is an alias of the crate-wide ENV_TEST_MUTEX so NIP-FI env-mutation
+    // tests in nip_fi_config.rs serialize against Config::from_env callers here.
+    // [F6: env-var serialization]
+    use crate::config::ENV_TEST_MUTEX as ENV_MUTEX;
 
     /// Look up against a fixed set, standing in for process env.
     fn env_of<'a>(set: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + use<'a> {

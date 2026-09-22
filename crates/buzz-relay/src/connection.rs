@@ -831,17 +831,41 @@ async fn send_loop_inner<S>(
             // cancellation can fall back to an unacknowledged close.
             biased;
             Some(restart) = restart_rx.recv() => {
-                let sent = matches!(
-                    tokio::time::timeout(
-                        WS_TERMINAL_FLUSH_TIMEOUT,
-                        ws_send.send(WsMessage::Close(Some(axum::extract::ws::CloseFrame {
-                        code: axum::extract::ws::close_code::RESTART,
-                        reason: axum::extract::ws::Utf8Bytes::from_static("relay restarting"),
-                        }))),
-                    ).await,
-                    Ok(Ok(()))
-                );
-                let _ = restart.flushed.send(sent);
+                // R1: an already-winning NIP-FI denial must be delivered before
+                // (and instead of) the 1012 restart close.  If the terminal
+                // channel holds a denial frame we honour that winning reason
+                // under the same bounded deadline, signal the restart sender
+                // that their 1012 was not sent (sent=false), and exit.  Only
+                // when no denial is queued do we send the 1012 as before.
+                // [FI-INV-05, R1 fix]
+                let deadline = tokio::time::Instant::now() + WS_TERMINAL_FLUSH_TIMEOUT;
+                if let Ok(denial_frame) = terminal_ctrl_rx.try_recv() {
+                    // A denial already won: deliver it and its close code ahead
+                    // of the restart 1012.  The restart close is not sent
+                    // (flushed=false) — the denial reason takes precedence.
+                    if tokio::time::timeout_at(deadline, ws_send.send(denial_frame))
+                        .await
+                        .is_ok_and(|r| r.is_ok())
+                    {
+                        let close = disconnect_reason
+                            .borrow()
+                            .map_or(WsMessage::Close(None), |reason| reason.close_message());
+                        let _ = tokio::time::timeout_at(deadline, ws_send.send(close)).await;
+                    }
+                    let _ = restart.flushed.send(false);
+                } else {
+                    let sent = matches!(
+                        tokio::time::timeout_at(
+                            deadline,
+                            ws_send.send(WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                            code: axum::extract::ws::close_code::RESTART,
+                            reason: axum::extract::ws::Utf8Bytes::from_static("relay restarting"),
+                            }))),
+                        ).await,
+                        Ok(Ok(()))
+                    );
+                    let _ = restart.flushed.send(sent);
+                }
                 break;
             }
             _ = cancel.cancelled() => {
@@ -2580,5 +2604,103 @@ pub(crate) mod tests {
             denial_pos < close_pos,
             "B3: expiry denial frame (pos {denial_pos}) must precede Close frame (pos {close_pos})"
         );
+    }
+
+    // ── R1: denial wins over concurrent restart — writer delivers denial close
+    //        rather than 1012 and signals restart.flushed=false ────────────────
+    //
+    // Schedule: denial already queued on terminal_ctrl_rx, restart command
+    // queued on restart_rx.  Biased select fires the restart arm first.
+    // Without the R1 fix, the restart arm sends 1012 and breaks without reading
+    // terminal_ctrl_rx, discarding the winning denial frame.
+    // With the R1 fix, the restart arm checks terminal_ctrl_rx first; if a
+    // denial frame is present it delivers the denial frame + denial close code
+    // and signals flushed=false.  The 1012 is not sent.
+    //
+    // Mutation evidence:
+    //   A) Remove the terminal_ctrl_rx.try_recv() check in the restart arm →
+    //      messages[0] becomes a 1012 instead of the denial frame → assertion panics.
+    //   B) Change `flushed.send(false)` to `flushed.send(true)` in the denial
+    //      branch → flushed_rx asserts false → assertion panics.
+
+    #[tokio::test]
+    async fn b3_denial_precedes_restart_when_denial_already_won() {
+        use crate::nip_fi_session::NipFiWsRoute;
+        use tokio::sync::mpsc;
+
+        let (_data_tx, data_rx) = mpsc::channel::<WsMessage>(16);
+        let (_ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
+        let (terminal_ctrl_tx, terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+        let (restart_tx, restart_rx) = mpsc::channel(1);
+        let (flushed_tx, flushed_rx) = tokio::sync::oneshot::channel::<bool>();
+        let cancel = CancellationToken::new();
+
+        // Enqueue the denial frame on the terminal channel.
+        let denial = crate::nip_fi_session::authorization_denied_frame(NipFiWsRoute::Root);
+        terminal_ctrl_tx
+            .try_send(denial.clone())
+            .expect("terminal channel is empty");
+
+        // Queue a restart command — the biased select will fire restart_rx first.
+        restart_tx
+            .send(RestartClose {
+                flushed: flushed_tx,
+            })
+            .await
+            .expect("queue restart close");
+
+        // Set the disconnect reason so denial close has a non-None close frame.
+        let control = crate::state::CommunityConnectionControl::new(cancel.clone());
+        control.manager_disconnect_nip_fi(
+            &terminal_ctrl_tx, // already consumed — this is a no-op try_send
+        );
+        let disconnect_reason = control.disconnect_reason();
+
+        let (sink, state_arc) = MockSink::new(None);
+        send_loop_inner(
+            sink,
+            data_rx,
+            ctrl_rx,
+            terminal_ctrl_rx,
+            restart_rx,
+            cancel,
+            disconnect_reason,
+        )
+        .await;
+
+        // restart.flushed must be false — the restart 1012 was not sent.
+        assert_eq!(
+            flushed_rx.await,
+            Ok(false),
+            "R1: restart.flushed must be false when denial already won (1012 not sent)"
+        );
+
+        let state = state_arc.lock().expect("mock sink poisoned");
+        let msgs = &state.messages;
+        assert!(
+            !msgs.is_empty(),
+            "R1: send_loop must write at least one frame when denial is queued"
+        );
+        // First frame must be the denial frame, not a 1012 close.
+        assert!(
+            matches!(&msgs[0], WsMessage::Text(t) if t.contains("authorization denied")),
+            "R1: first frame must be the denial frame, not 1012 — \
+             got {:?}. \
+             Mutation: remove terminal_ctrl_rx check from restart arm → 1012 sent instead → panics.",
+            msgs.get(0)
+        );
+        // Last frame must be a Close (the denial close code, not 1012).
+        let last = msgs.last().expect("at least one frame");
+        match last {
+            WsMessage::Close(Some(close)) => {
+                assert_ne!(
+                    close.code,
+                    axum::extract::ws::close_code::RESTART,
+                    "R1: close code must not be 1012 (restart) when denial won"
+                );
+            }
+            WsMessage::Close(None) => {}
+            other => panic!("R1: last frame must be Close, got {other:?}"),
+        }
     }
 }
