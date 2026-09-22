@@ -42,8 +42,9 @@ pub struct AudioPeer {
     /// peers are excluded from roster snapshots so a concurrent joiner cannot
     /// observe a peer that may later fail to commit.
     ///
-    /// Set to `true` by [`Room::mark_committed`] after `commit_participant_join`
-    /// succeeds. [Fix 7: FI-TRACE-PENDING-PEER-LEAK]
+    /// Set to `true` by [`Room::commit_peer`] (which also bumps the roster
+    /// revision and fires the joined delta) or by [`Room::mark_committed`]
+    /// (flag only, no delta — used in tests). [Fix 7: FI-TRACE-PENDING-PEER-LEAK]
     pub committed: bool,
 }
 
@@ -113,6 +114,19 @@ pub type PeerAdmission = (
     u64,
 );
 
+/// Successful pending admission (pre-commit): peer ID, routing index,
+/// per-index epoch, audio/control receivers, and the roster revision at the
+/// time of pending insert (used as the `roster_revision` in the kind-48101
+/// event content — informational snapshot, not the post-commit revision).
+pub type PendingPeerAdmission = (
+    Uuid,
+    u8,
+    u8,
+    mpsc::Receiver<Bytes>,
+    mpsc::Receiver<PeerCtrl>,
+    u64, // snapshot revision at pending-insert time
+);
+
 /// Successful admission at an owner-assigned index: peer ID, per-index epoch,
 /// audio/control receivers, and the roster revision. The routing index is
 /// omitted because the caller supplied it.
@@ -122,6 +136,17 @@ pub type IndexedPeerAdmission = (
     mpsc::Receiver<Bytes>,
     mpsc::Receiver<PeerCtrl>,
     u64,
+);
+
+/// Successful pending admission at an owner-assigned index (pre-commit): peer
+/// ID, per-index epoch, audio/control receivers, and the snapshot revision at
+/// pending-insert time.
+pub type PendingIndexedPeerAdmission = (
+    Uuid,
+    u8,
+    mpsc::Receiver<Bytes>,
+    mpsc::Receiver<PeerCtrl>,
+    u64, // snapshot revision at pending-insert time
 );
 
 /// Reason a peer was refused entry to a room.
@@ -352,6 +377,10 @@ impl Room {
     /// Add a non-owner ingress peer at the index already allocated by the
     /// authoritative owner. No client-visible state is emitted before this
     /// succeeds, so a remote client has exactly one identity end-to-end.
+    ///
+    /// Fires the joined delta immediately (pre-commit). Use
+    /// [`Self::add_peer_at_index_pending`] + [`Self::commit_peer`] on paths
+    /// where the admission transaction has not yet committed.
     pub fn add_peer_at_index(
         &self,
         pubkey: String,
@@ -434,15 +463,176 @@ impl Room {
         Some(delta)
     }
 
+    /// Add a peer without publishing the admission. Returns
+    /// `(peer_id, peer_index, epoch, audio_rx, ctrl_rx)` on success, or an
+    /// [`AdmissionError`] explaining why the peer was rejected.
+    ///
+    /// Unlike [`Self::add_peer`], this method does **not** advance the roster
+    /// revision or emit a delta on [`Self::roster_tx`]. The peer is inserted
+    /// with `committed = false` and remains invisible to
+    /// [`Self::roster_snapshot`] and to consumers of the roster broadcast
+    /// channel until [`Self::commit_peer`] is called.
+    ///
+    /// Use this on paths where the actual DB admission transaction has not yet
+    /// committed: callers call [`Self::commit_peer`] once the transaction
+    /// succeeds (or [`Self::remove_peer`] on rollback).
+    ///
+    /// The cap check, ended check, version pin, and index allocation all happen
+    /// under the admission guard lock — identical to [`Self::add_peer`].
+    pub fn add_peer_pending(
+        &self,
+        pubkey: String,
+        requested_version: u8,
+    ) -> Result<PendingPeerAdmission, AdmissionError> {
+        let mut g = self.guard.lock().map_err(|_| AdmissionError::Ended)?;
+        if g.ended {
+            return Err(AdmissionError::Ended);
+        }
+        if self.peers.len() >= MAX_PEERS_PER_ROOM {
+            return Err(AdmissionError::Full);
+        }
+        if let Some(pinned) = g.pinned_version {
+            if pinned != requested_version {
+                return Err(AdmissionError::VersionMismatch {
+                    pinned,
+                    requested: requested_version,
+                });
+            }
+        }
+        let (peer_index, epoch) = g.alloc().ok_or(AdmissionError::Full)?;
+        g.pinned_version.get_or_insert(requested_version);
+        let snapshot_revision = g.roster_revision;
+        let peer_id = Uuid::new_v4();
+        let (audio_tx, audio_rx) = mpsc::channel(AUDIO_CHANNEL_CAPACITY);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(CTRL_CHANNEL_CAPACITY);
+        self.peers.insert(
+            peer_id,
+            AudioPeer {
+                pubkey,
+                audio_tx,
+                ctrl_tx,
+                peer_index,
+                epoch,
+                protocol_version: requested_version,
+                committed: false, // commit_peer publishes the admission
+            },
+        );
+        // No roster_revision bump; no roster_tx send — deferred to commit_peer.
+        drop(g);
+        Ok((
+            peer_id,
+            peer_index,
+            epoch,
+            audio_rx,
+            ctrl_rx,
+            snapshot_revision,
+        ))
+    }
+
+    /// Add a non-owner ingress peer at the index already allocated by the
+    /// authoritative owner, without publishing the admission.
+    ///
+    /// The pending peer is invisible to [`Self::roster_snapshot`] and to the
+    /// roster broadcast channel until [`Self::commit_peer`] is called.
+    ///
+    /// See [`Self::add_peer_pending`] for the rationale.
+    pub fn add_peer_at_index_pending(
+        &self,
+        pubkey: String,
+        requested_version: u8,
+        peer_index: u8,
+    ) -> Result<PendingIndexedPeerAdmission, AdmissionError> {
+        let mut g = self.guard.lock().map_err(|_| AdmissionError::Ended)?;
+        if g.ended {
+            return Err(AdmissionError::Ended);
+        }
+        if self.peers.len() >= MAX_PEERS_PER_ROOM || g.active_indices.contains(&peer_index) {
+            return Err(AdmissionError::Full);
+        }
+        if let Some(pinned) = g.pinned_version {
+            if pinned != requested_version {
+                return Err(AdmissionError::VersionMismatch {
+                    pinned,
+                    requested: requested_version,
+                });
+            }
+        }
+        g.pinned_version.get_or_insert(requested_version);
+        g.active_indices.insert(peer_index);
+        let epoch = g.next_epoch_for(peer_index);
+        g.next_candidate = if peer_index == 254 { 0 } else { peer_index + 1 };
+        let snapshot_revision = g.roster_revision;
+        let peer_id = Uuid::new_v4();
+        let (audio_tx, audio_rx) = mpsc::channel(AUDIO_CHANNEL_CAPACITY);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(CTRL_CHANNEL_CAPACITY);
+        self.peers.insert(
+            peer_id,
+            AudioPeer {
+                pubkey,
+                audio_tx,
+                ctrl_tx,
+                peer_index,
+                epoch,
+                protocol_version: requested_version,
+                committed: false, // commit_peer publishes the admission
+            },
+        );
+        // No roster_revision bump; no roster_tx send — deferred to commit_peer.
+        drop(g);
+        Ok((peer_id, epoch, audio_rx, ctrl_rx, snapshot_revision))
+    }
+
     /// Mark a peer as committed after its admission transaction succeeds.
     ///
     /// Committed peers appear in [`Self::roster_snapshot`]; pending (pre-commit)
     /// peers are excluded so a concurrent joiner's snapshot cannot contain a
     /// peer that may later fail to commit. [Fix 7: FI-TRACE-PENDING-PEER-LEAK]
+    ///
+    /// Callers that also need to advance the roster revision and fire the
+    /// joined delta (the production paths) should use [`Self::commit_peer`]
+    /// instead, which is atomic over all three operations.
     pub fn mark_committed(&self, peer_id: Uuid) {
         if let Some(mut peer) = self.peers.get_mut(&peer_id) {
             peer.committed = true;
         }
+    }
+
+    /// Publish a pending peer's admission atomically.
+    ///
+    /// Marks the peer as committed (visible in [`Self::roster_snapshot`] and
+    /// resync payloads), increments the roster revision, and emits the joined
+    /// [`RosterDelta`] on the broadcast channel so existing
+    /// `serve_control_loop` streams and roster subscribers see it.
+    ///
+    /// This is the "commit" half of the two-phase admission sequence used by
+    /// both the owner-local path (called from `commit_participant_join` after
+    /// the DB transaction commits) and the cross-pod path (called from
+    /// `serve_control_loop` when `CommitConfirmed` arrives from the ingress).
+    ///
+    /// Returns the roster revision assigned to this admission, or `None` if
+    /// the peer no longer exists (it was removed before confirmation arrived —
+    /// safe to treat as a no-op). [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
+    pub fn commit_peer(&self, peer_id: Uuid) -> Option<u64> {
+        let mut g = self.guard.lock().ok()?;
+        let mut entry = self.peers.get_mut(&peer_id)?;
+        entry.committed = true;
+        let peer_index = entry.peer_index;
+        let epoch = entry.epoch;
+        let pubkey = entry.pubkey.clone();
+        drop(entry); // release DashMap write guard before lock scope ends
+        g.roster_revision = g.roster_revision.wrapping_add(1);
+        let revision = g.roster_revision;
+        let delta = RosterDelta {
+            revision,
+            joined: Some(RosterPeer {
+                pubkey,
+                peer_index,
+                epoch,
+            }),
+            left: None,
+        };
+        let _ = self.roster_tx.send(delta);
+        Some(revision)
     }
 
     /// Remove a peer AND atomically check if the room should end.
@@ -1058,6 +1248,190 @@ mod tests {
             "F7a: committed peer in snapshot must carry the correct peer_index"
         );
     }
+
+    // ── Option-B (commit-before-publish) witnesses ────────────────────────────
+    //
+    // These three tests pin the invariant "failed admissions invisible to all
+    // observers" and the complementary "successful commit produces exactly one
+    // joined delta with a monotone revision".
+    //
+    // Mutation oracle guidance (in parentheses after each assertion):
+    //   – Swap `add_peer_pending` → `add_peer` on the remote path →
+    //     WITNESS 1 RED (delta appears before remove_peer).
+    //   – Skip `commit_peer` on rollback → WITNESS 2 RED (delta emitted while
+    //     slot is still present after rollback).
+    //   – Remove the roster_revision increment from `commit_peer` → WITNESS 3
+    //     RED (revision does not advance past snapshot value).
+
+    /// Fix-B witness 1: a pending peer removed before `commit_peer` emits NO
+    /// joined delta.  This covers the remote failure path: ingress rolls back
+    /// → stream closes → teardown calls `remove_peer` on the pending slot →
+    /// the slot was never visible.
+    ///
+    /// Mutation oracle: publish at registration (swap to `add_peer`) → RED —
+    /// the delta is in the channel before `remove_peer` and `try_recv` finds
+    /// it.
+    #[test]
+    fn b1_pending_peer_removed_before_commit_emits_no_joined_delta() {
+        let room = fresh_room();
+        // Subscribe before any mutation so we observe everything.
+        let mut deltas = room.subscribe_roster();
+
+        // Add Alice (committed) so the room is non-empty — makes sure a
+        // pending peer's removal does not accidentally fire a leave delta
+        // that pollutes the channel before our assertion.
+        let (alice_id, ..) = room.add_peer("alice".into(), 2).unwrap();
+        room.mark_committed(alice_id);
+        // Drain alice's joined delta.
+        let _ = deltas.try_recv().unwrap();
+
+        // Add Bob as pending (remote-path deferral).
+        let (bob_id, ..) = room.add_peer_pending("bob".into(), 2).unwrap();
+
+        // Simulate rollback: remove the pending slot before any commit.
+        room.remove_peer(bob_id).expect("pending peer exists");
+
+        // No joined delta for Bob must have been emitted: the next event in the
+        // channel must be Bob's leave delta (revision bump from remove_peer),
+        // with `joined == None`.  There must be no event with `joined == Some`.
+        let leave = deltas.try_recv().expect("leave delta expected");
+        assert!(
+            leave.joined.is_none(),
+            "remove of pending peer must emit leave-only delta, got joined={:?}",
+            leave.joined
+        );
+        assert!(
+            leave.left.as_ref().map(|p| p.pubkey.as_str()) == Some("bob"),
+            "leave delta must name the pending peer"
+        );
+        // Channel must now be empty — no spurious joined delta was buffered.
+        assert!(
+            deltas.try_recv().is_err(),
+            "no additional delta must follow a pending-peer removal"
+        );
+    }
+
+    /// Fix-B witness 2: `commit_peer` after a successful DB commit emits
+    /// exactly one joined delta and marks the peer visible in snapshots.
+    ///
+    /// Mutation oracle: remove the `commit_peer` call (skip publish on success)
+    /// → RED — delta channel stays empty, snapshot omits the peer.
+    #[test]
+    fn b2_commit_peer_emits_exactly_one_joined_delta_and_marks_visible() {
+        let room = fresh_room();
+        let mut deltas = room.subscribe_roster();
+
+        let (peer_id, peer_index, epoch, ..) = room.add_peer_pending("charlie".into(), 2).unwrap();
+
+        // Before commit: peer absent from snapshot.
+        let pre = room.roster_snapshot();
+        assert!(
+            pre.peers.iter().all(|p| p.pubkey != "charlie"),
+            "pending peer must be absent from snapshot before commit"
+        );
+        assert!(
+            deltas.try_recv().is_err(),
+            "no delta must be emitted before commit_peer"
+        );
+
+        // Simulate successful DB commit.
+        let revision = room
+            .commit_peer(peer_id)
+            .expect("commit_peer must return Some");
+
+        // Exactly one joined delta.
+        let delta = deltas
+            .try_recv()
+            .expect("joined delta expected after commit_peer");
+        assert!(
+            deltas.try_recv().is_err(),
+            "exactly one delta must be emitted by commit_peer"
+        );
+        assert_eq!(
+            delta.joined.as_ref().map(|p| p.pubkey.as_str()),
+            Some("charlie"),
+            "joined delta must name the committed peer"
+        );
+        assert_eq!(
+            delta.joined.as_ref().map(|p| p.peer_index),
+            Some(peer_index),
+            "joined delta must carry the correct peer_index"
+        );
+        assert_eq!(
+            delta.joined.as_ref().map(|p| p.epoch),
+            Some(epoch),
+            "joined delta must carry the correct epoch"
+        );
+        assert_eq!(
+            delta.revision, revision,
+            "delta revision must match commit_peer return"
+        );
+
+        // Post-commit: peer visible in snapshot with matching revision.
+        let post = room.roster_snapshot();
+        assert!(
+            post.peers.iter().any(|p| p.pubkey == "charlie"),
+            "committed peer must appear in snapshot after commit_peer"
+        );
+        assert_eq!(
+            post.revision, revision,
+            "snapshot revision must equal the commit_peer revision"
+        );
+    }
+
+    /// Fix-B witness 3: revision ordering is preserved when a pending peer
+    /// commits between two other committed peers.  The committed peer gets a
+    /// revision strictly greater than the pre-admit snapshot and strictly less
+    /// than the next leave's revision.
+    ///
+    /// Mutation oracle: remove the `roster_revision` increment from
+    /// `commit_peer` → RED — revision does not advance past snapshot value.
+    #[test]
+    fn b3_commit_peer_revision_is_monotone_between_concurrent_events() {
+        let room = fresh_room();
+        let mut deltas = room.subscribe_roster();
+
+        // Add Alice (committed immediately — normal path).
+        let (alice_id, ..) = room.add_peer("alice".into(), 2).unwrap();
+        room.mark_committed(alice_id);
+        let alice_delta = deltas.try_recv().unwrap();
+        let rev_after_alice = alice_delta.revision;
+
+        // Add Bob as pending — no delta yet, revision unchanged.
+        let (bob_id, ..) = room.add_peer_pending("bob".into(), 2).unwrap();
+        assert!(
+            deltas.try_recv().is_err(),
+            "pending add must not advance revision"
+        );
+        assert_eq!(
+            room.roster_snapshot().revision,
+            rev_after_alice,
+            "snapshot revision must not advance for pending peer"
+        );
+
+        // Commit Bob (simulates ingress tx commit + CommitConfirmed).
+        let bob_revision = room
+            .commit_peer(bob_id)
+            .expect("commit_peer must return Some");
+        assert!(
+            bob_revision > rev_after_alice,
+            "bob's commit revision ({bob_revision}) must be > alice's ({rev_after_alice})"
+        );
+        let bob_delta = deltas.try_recv().unwrap();
+        assert_eq!(bob_delta.revision, bob_revision);
+
+        // Alice leaves — her leave revision must be > Bob's commit revision.
+        room.remove_peer(alice_id).unwrap();
+        let leave_delta = deltas.try_recv().unwrap();
+        assert!(
+            leave_delta.revision > bob_revision,
+            "leave revision ({}) must be > bob commit revision ({})",
+            leave_delta.revision,
+            bob_revision
+        );
+    }
+
+    // ── end Option-B witnesses ────────────────────────────────────────────────
 
     /// Per Sami/Perci's review: when a room is both at-capacity AND the
     /// joiner's protocol version doesn't match the pin, the error must be

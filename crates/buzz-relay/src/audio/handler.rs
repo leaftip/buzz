@@ -981,21 +981,28 @@ pub(crate) async fn handle_active_audio_connection(
                 return;
             }
         };
-        // Permit is held across add_peer[_at_index] — drop after the call.
+        // Permit is held across add_peer[_at_index]_pending — drop after the call.
+        // Use the pending (no-delta) variants: the joined delta fires at commit_peer
+        // inside commit_participant_join, after the DB transaction commits.
+        // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
         if let Some(session) = guard.remote_session.as_ref() {
-            room.add_peer_at_index(pubkey_hex.clone(), requested_version, session.peer_index())
-                .map(|(id, _mirror_epoch, audio, ctrl, revision)| {
-                    (
-                        id,
-                        session.peer_index(),
-                        session.epoch(),
-                        audio,
-                        ctrl,
-                        revision,
-                    )
-                })
+            room.add_peer_at_index_pending(
+                pubkey_hex.clone(),
+                requested_version,
+                session.peer_index(),
+            )
+            .map(|(id, _mirror_epoch, audio, ctrl, snapshot_rev)| {
+                (
+                    id,
+                    session.peer_index(),
+                    session.epoch(),
+                    audio,
+                    ctrl,
+                    snapshot_rev,
+                )
+            })
         } else {
-            room.add_peer(pubkey_hex.clone(), requested_version)
+            room.add_peer_pending(pubkey_hex.clone(), requested_version)
         }
     };
     let (peer_id, peer_index, peer_epoch, audio_rx, peer_ctrl_rx, admission_revision) =
@@ -1210,6 +1217,34 @@ pub(crate) async fn handle_active_audio_connection(
     {
         Ok(CommitJoinOutcome::JoinedSent) => {
             // `joined` was broadcast inside the permit — normal flow.
+            //
+            // Fix B (remote path): now that the ingress DB transaction has
+            // committed, tell the owner that this peer's slot is committed so
+            // the owner calls `commit_peer` (fires the joined delta + marks
+            // committed). Best-effort: if the stream is already gone, the
+            // owner's teardown will remove the pending slot on stream close.
+            // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
+            if let (Some(stream), Some(pk)) = (
+                guard.remote_stream.as_mut(),
+                guard
+                    .remote_session
+                    .as_ref()
+                    .map(|s| s.pubkey().to_string()),
+            ) {
+                use crate::audio::join::{encode_control, HuddleControlMsg};
+                let fenced = guard
+                    .remote_session
+                    .as_ref()
+                    .expect("remote_stream implies remote_session")
+                    .fenced();
+                if let Ok(payload) =
+                    encode_control(&HuddleControlMsg::CommitConfirmed { pubkey: pk })
+                {
+                    let _ = stream
+                        .send_frame(buzz_relay_mesh::MeshStreamFrame::Data { fenced, payload })
+                        .await;
+                }
+            }
         }
         Ok(CommitJoinOutcome::JoinedSendFailed) => {
             // Committed but the joining peer's ctrl channel was saturated.
@@ -2565,17 +2600,19 @@ async fn commit_participant_join(
         return Err(JoinCommitError::Db(e.into()));
     }
 
-    // Fix 7: mark the peer as committed so future roster snapshots include it.
-    // Pending (pre-commit) peers are excluded from snapshots to prevent a
-    // concurrent joiner from observing a peer that may later fail admission.
-    // [FI-TRACE-PENDING-PEER-LEAK]
-    room.mark_committed(peer_id);
+    // Fix B (commit-before-publish): call `commit_peer` which atomically
+    // marks the peer committed, increments the roster revision, and fires
+    // the joined delta on `Room::roster_tx` — so the delta is only visible
+    // to other control loops AFTER the DB transaction has committed.
+    // [Fix 7: FI-TRACE-PENDING-PEER-LEAK]
+    // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
+    let commit_revision = room.commit_peer(peer_id);
 
     // Fix 7a: build the joined payload from committed state — after
-    // mark_committed, roster_snapshot includes the joining peer (peer_id) plus
+    // commit_peer, roster_snapshot includes the joining peer (peer_id) plus
     // every already-committed peer, so already-connected clients see the full
     // new roster. Unrelated pending peers (still committed=false) are excluded.
-    // Building the snapshot here (post-commit, post-mark_committed) is the only
+    // Building the snapshot here (post-commit, post-commit_peer) is the only
     // correct point; the pre-commit snapshot taken in handle_active_audio_connection
     // before commit would omit the joining peer from peers[], causing already-
     // connected clients to drop the joiner's audio stream.
@@ -2595,7 +2632,11 @@ async fn commit_participant_join(
                     serde_json::json!({"pubkey": p.pubkey, "peer_index": p.peer_index, "epoch": p.epoch})
                 })
                 .collect();
-        (owner.revision, peers)
+        // Use the post-commit revision if available; fall back to owner snapshot
+        // revision for the cross-pod path (commit_revision is None only if the
+        // peer slot was removed before confirmation, an unreachable steady-state).
+        let rev = commit_revision.unwrap_or(owner.revision);
+        (rev, peers)
     } else {
         let joined_snapshot = room.roster_snapshot();
         let peers = joined_snapshot
@@ -2664,12 +2705,12 @@ async fn commit_participant_join(
 
     // IMPORTANT 5: broadcast `joined` to all peers (including the joiner) while
     // the commit-won permit is still held. `broadcast_control` sends via each
-    // peer's ctrl channel; the joining peer's channel was created by add_peer and
-    // is read by the audio_forward_loop once it starts. The message is buffered
-    // in that channel until the loop drains it.
+    // peer's ctrl channel; the joining peer's channel was created by add_peer_pending
+    // and is read by the audio_forward_loop once it starts. The message is
+    // buffered in that channel until the loop drains it.
     //
-    // The peer's ctrl channel is freshly created by add_peer (capacity 8) so the
-    // try_send inside broadcast_control will succeed. JoinedSent is always
+    // The peer's ctrl channel is freshly created by add_peer_pending (capacity 8)
+    // so the try_send inside broadcast_control will succeed. JoinedSent is always
     // returned; JoinedSendFailed is structurally unreachable here but kept for
     // completeness — the forward loop's dead-channel path handles any future
     // saturation case at runtime.
