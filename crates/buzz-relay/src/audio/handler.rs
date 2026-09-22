@@ -5349,14 +5349,12 @@ mod tests {
     //   on `content_json["lifecycle_generation"]` panics.
     //   Use a hard-coded string instead of `state.huddle_liveness_generation` →
     //   the lifecycle/liveness equality assertion panics (generation mismatch).
-    #[tokio::test]
-    #[ignore = "requires Postgres — postgres://buzz:buzz_dev@127.0.0.1:5432/buzz"]
-    async fn f3_commit_participant_join_includes_lifecycle_generation() {
+    async fn f3_commit_participant_join_includes_lifecycle_generation_body() {
         use uuid::Uuid;
 
-        let state = audio_test_state_real_db()
-            .await
-            .expect("F3: local DB must be available (test is marked #[ignore])");
+        let state = audio_test_state_real_db().await.expect(
+            "F3: local DB must be available (test is marked #[ignore = \"requires Postgres\"])",
+        );
         let pool = state.db.pool().clone();
         let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
         let community_id = tenant.community();
@@ -7285,5 +7283,19 @@ mod tests {
             guard.remote_stream.is_none(),
             "CW7: remote_stream must be cleared after release_before_commit"
         );
+    }
+
+    mod postgres_tests {
+        /// F3: lifecycle_generation committed in kind-48101 JOIN matches the relay's
+        /// global liveness generation (the same value `handle_huddle_liveness_req`
+        /// returns for Off-mode rooms).
+        ///
+        /// This test is discoverable by the PostgreSQL Tests CI lane and exercises
+        /// the full DB-write path on a live Postgres instance.
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn f3_commit_participant_join_includes_lifecycle_generation() {
+            super::f3_commit_participant_join_includes_lifecycle_generation_body().await;
+        }
     }
 }
