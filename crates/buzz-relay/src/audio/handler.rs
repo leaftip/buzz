@@ -702,7 +702,7 @@ pub(crate) async fn handle_active_audio_connection(
                 return;
             }
             match crate::audio::join::resolve_join_owner_ready(
-                &mesh.directory,
+                mesh.effective_directory(),
                 tenant.community(),
                 channel_id,
                 mesh.local_runtime_id,
@@ -2585,27 +2585,28 @@ async fn commit_participant_join(
     // returned at `RegisterPeer` time (already includes the joining peer and
     // all owner-pod participants). Use it instead of the ingress-local room
     // snapshot, which only contains the joining peer.
-    let (joined_revision, joined_peers): (u64, Vec<serde_json::Value>) =
-        if let Some(owner) = owner_roster {
-            let peers = owner
+    let (joined_revision, joined_peers): (u64, Vec<serde_json::Value>) = if let Some(owner) =
+        owner_roster
+    {
+        let peers = owner
                 .peers
                 .iter()
                 .map(|p| {
                     serde_json::json!({"pubkey": p.pubkey, "peer_index": p.peer_index, "epoch": p.epoch})
                 })
                 .collect();
-            (owner.revision, peers)
-        } else {
-            let joined_snapshot = room.roster_snapshot();
-            let peers = joined_snapshot
+        (owner.revision, peers)
+    } else {
+        let joined_snapshot = room.roster_snapshot();
+        let peers = joined_snapshot
                 .peers
                 .iter()
                 .map(|p| {
                     serde_json::json!({"pubkey": p.pubkey, "peer_index": p.peer_index, "epoch": p.epoch})
                 })
                 .collect();
-            (joined_snapshot.revision, peers)
-        };
+        (joined_snapshot.revision, peers)
+    };
     let joined_msg = serde_json::json!({
         "type": "joined",
         "revision": joined_revision,
@@ -4605,8 +4606,8 @@ mod tests {
     /// dropped without sending the denial → client receives only Close → assertion panics.
     #[tokio::test]
     async fn f3_audio_outer_wrapper_delivers_denial_on_bootstrap_cancellation() {
-        use axum::{routing::get, Router};
         use axum::extract::ws::WebSocketUpgrade;
+        use axum::{routing::get, Router};
         use buzz_auth::VerifiedAssertion;
         use chrono::{Duration, Utc};
         use futures_util::StreamExt as _;
@@ -4793,7 +4794,7 @@ mod tests {
                     tenant.community(),
                     channel_id,
                 )),
-            None, // same-pod test — no owner roster
+                None, // same-pod test — no owner roster
             )
             .await;
 
@@ -4896,7 +4897,7 @@ mod tests {
                         tenant2.community(),
                         channel_id,
                     )),
-                None, // same-pod test — no owner roster
+                    None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5102,7 +5103,7 @@ mod tests {
                         tenant2.community(),
                         child_channel_id,
                     )),
-                None, // same-pod test — no owner roster
+                    None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5236,7 +5237,7 @@ mod tests {
                         tenant2.community(),
                         channel_id,
                     )),
-                None, // same-pod test — no owner roster
+                    None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5373,7 +5374,7 @@ mod tests {
                         tenant_a.community(),
                         channel_id,
                     )),
-                None, // same-pod test — no owner roster
+                    None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5417,7 +5418,7 @@ mod tests {
                         tenant_b.community(),
                         channel_id,
                     )),
-                None, // same-pod test — no owner roster
+                    None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5524,7 +5525,7 @@ mod tests {
                         tenant1.community(),
                         channel_id,
                     )),
-                None, // same-pod test — no owner roster
+                    None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5568,7 +5569,7 @@ mod tests {
                         tenant2.community(),
                         channel_id,
                     )),
-                None, // same-pod test — no owner roster
+                    None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5802,7 +5803,7 @@ mod tests {
                         tenant2.community(),
                         child_channel_id,
                     )),
-                None, // same-pod test — no owner roster
+                    None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5997,7 +5998,7 @@ mod tests {
                         tenant2.community(),
                         channel_id,
                     )),
-                None, // same-pod test — no owner roster
+                    None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -6562,7 +6563,7 @@ mod tests {
                         tenant2.community(),
                         channel_id,
                     )),
-                None, // same-pod test — no owner roster
+                    None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -6935,7 +6936,7 @@ mod tests {
                 },
                 &gate,
                 &room,
-            None, // same-pod test — no owner roster
+                None, // same-pod test — no owner roster
             )
             .await;
 
@@ -7061,7 +7062,7 @@ mod tests {
                     },
                     &gate2,
                     &room2,
-                None, // same-pod test — no owner roster
+                    None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -7256,7 +7257,7 @@ mod tests {
                 },
                 &gate,
                 &room,
-            None, // same-pod test — no owner roster
+                None, // same-pod test — no owner roster
             )
             .await;
             assert!(
@@ -7440,17 +7441,17 @@ mod tests {
             );
 
             // The listener receives the joined broadcast.
-            let ctrl_msg = listener_ctrl_rx
-                .try_recv()
-                .expect("F7a-cross-pod: listener must receive a `joined` broadcast after bob joins");
+            let ctrl_msg = listener_ctrl_rx.try_recv().expect(
+                "F7a-cross-pod: listener must receive a `joined` broadcast after bob joins",
+            );
             let msg = match ctrl_msg {
                 crate::audio::room::PeerCtrl::Json(s) => s,
                 crate::audio::room::PeerCtrl::Close => {
                     panic!("F7a-cross-pod: expected Json ctrl message, got Close")
                 }
             };
-            let parsed: serde_json::Value =
-                serde_json::from_str(&msg).expect("F7a-cross-pod: joined broadcast must be valid JSON");
+            let parsed: serde_json::Value = serde_json::from_str(&msg)
+                .expect("F7a-cross-pod: joined broadcast must be valid JSON");
 
             let peers_array = parsed["peers"]
                 .as_array()
@@ -7562,6 +7563,305 @@ mod tests {
                  Mutation oracle B: pass 0 instead of owner_generation to release → \
                  generation fence rejects → entry still present → panics"
             );
+        }
+
+        // ── F7b (handler-level): B1 exit releases owner lease via REAL caller ────
+        //
+        // Drives `handle_active_audio_connection` through a full WS+NIP-42 path,
+        // using the `#[cfg(test)]` directory seam (`MeshHandle::for_test_only` +
+        // `with_test_directory`) so no Redis is required.
+        //
+        // ## Schedule
+        //
+        // 1. `FakeLocalOwner` returns `Ownership { owner_runtime_id = mesh.local_runtime_id, generation = 77 }`.
+        // 2. `resolve_join_owner_ready` → `LocalOwner { generation: 77 }` (reuse arm,
+        //    entry pre-installed).
+        // 3. Handler sets `owner_generation = Some(77)`.
+        // 4. `after_add_peer` hook fires → test cancels `conn_cancel`.
+        // 5. `check_cancel!(cleanup: {...})` → `release_before_commit()` removes the single
+        //    peer → `room_cleaned = true` → `mesh.owners.release(channel_id, 77)` →
+        //    generation-fenced release succeeds → entry removed.
+        // 6. Assert `!mesh.owners.has_entry(channel_id)`.
+        //
+        // ## Stale-generation control
+        //
+        // Pre-install the registry entry with `generation = 999` but `FakeLocalOwner`
+        // returns `generation = 77`. Handler calls `release(channel_id, 77)`.
+        // Generation fence rejects (expected 999, got 77) → entry stays.
+        // Asserts `mesh.owners.has_entry(channel_id)` — entry was NOT released.
+        //
+        // ## Mutation oracle
+        //
+        // Revert Fix 7c: move `owner_generation` resolution to AFTER the B1 cancel
+        // check (the pre-fix location). Owner_generation is `None` at B1 time →
+        // `release` is never called → entry stays → `has_entry` assertion panics.
+        //
+        // This proves the PRODUCTION CALLER is bound: deleting the Fix-7c production
+        // line makes this test go red. The unit-level `f7b_pre_b1_generation_lookup_matches_release_generation`
+        // above proves the registry API contract in isolation.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn f7b_b1_handler_releases_owner_lease_via_real_caller() {
+            use buzz_auth::VerifiedAssertion;
+            use buzz_relay_mesh::wire::FencedHeader;
+            use buzz_relay_mesh::MeshError;
+            use chrono::{Duration, Utc};
+            use futures_util::StreamExt as _;
+            use std::sync::Arc;
+            use tokio::net::TcpListener;
+            use tokio_tungstenite::connect_async;
+
+            use crate::audio::join::{
+                AcquireOutcome, HuddleDirectory, HuddleLease, HuddleOwnerRegistry,
+                HuddleReleaseOutcome, HuddleRenewOutcome, Ownership,
+            };
+            use buzz_core::CommunityId;
+            use buzz_relay_mesh::RuntimeId;
+            use uuid::Uuid;
+
+            // A scripted HuddleDirectory that returns a fixed LocalOwner ownership.
+            // `owner_of` returns `Some(Ownership { owner_runtime_id: runtime_id, generation })`.
+            // All other methods are unreachable in the LocalOwner reuse arm.
+            struct FakeLocalOwner {
+                runtime_id: RuntimeId,
+                generation: u64,
+            }
+
+            #[async_trait::async_trait]
+            impl HuddleDirectory for FakeLocalOwner {
+                async fn owner_of(
+                    &self,
+                    _community_id: CommunityId,
+                    _session_id: Uuid,
+                ) -> Result<Option<Ownership>, MeshError> {
+                    Ok(Some(Ownership {
+                        owner_runtime_id: self.runtime_id,
+                        generation: self.generation,
+                    }))
+                }
+                async fn acquire(
+                    &self,
+                    _c: CommunityId,
+                    _s: Uuid,
+                    _owner: RuntimeId,
+                ) -> Result<AcquireOutcome, MeshError> {
+                    unreachable!("FakeLocalOwner: acquire must not be called on reuse arm")
+                }
+                async fn renew(
+                    &self,
+                    _lease: &HuddleLease,
+                ) -> Result<HuddleRenewOutcome, MeshError> {
+                    unreachable!("FakeLocalOwner: renew must not be called in this test")
+                }
+                async fn release(
+                    &self,
+                    _lease: &HuddleLease,
+                ) -> Result<HuddleReleaseOutcome, MeshError> {
+                    unreachable!("FakeLocalOwner: lease release must not be called (reuse arm holds no lease)")
+                }
+                async fn validate(
+                    &self,
+                    _c: CommunityId,
+                    _fenced: &FencedHeader,
+                ) -> Result<(), MeshError> {
+                    unreachable!("FakeLocalOwner: validate must not be called on local-owner arm")
+                }
+            }
+
+            // ── Setup ──────────────────────────────────────────────────────────
+            let state = audio_test_state_real_db()
+                .await
+                .expect("F7b-handler: PostgreSQL must be available");
+            let pool = state.db.pool().clone();
+            let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
+            let community = tenant.community();
+            let tenant_host = tenant.host().to_string();
+
+            let key = member_key; // already a channel member → admission succeeds
+            let assertion = VerifiedAssertion::for_test(
+                Some(key.public_key()),
+                vec![Utc::now() + Duration::hours(1)],
+            );
+
+            // ── Build a test MeshHandle with FakeLocalOwner ────────────────────
+            let owners = Arc::new(HuddleOwnerRegistry::new());
+            let mesh = crate::mesh_boot::MeshHandle::for_test_only(Arc::clone(&owners)).await;
+            let runtime_id = mesh.local_runtime_id;
+            let owned_generation: u64 = 77;
+            let mesh = mesh.with_test_directory(Arc::new(FakeLocalOwner {
+                runtime_id,
+                generation: owned_generation,
+            }));
+
+            // Pre-install the registry entry so `resolve_join_owner_ready` sees the
+            // live entry and takes the reuse arm immediately.
+            owners.install_for_test(channel_id, owned_generation);
+
+            // Install the mesh handle on state.
+            state
+                .mesh
+                .set(mesh)
+                .map_err(|_| ())
+                .expect("F7b-handler: mesh OnceLock already set — state must be fresh");
+
+            // ── Stale-generation control ───────────────────────────────────────
+            // Pre-install a DIFFERENT entry (generation 999) on a separate registry to
+            // prove the generation fence works: release with the wrong generation
+            // (77) leaves the entry intact.
+            {
+                let stale_owners = Arc::new(HuddleOwnerRegistry::new());
+                let stale_generation: u64 = 999;
+                stale_owners.install_for_test(channel_id, stale_generation);
+                // release with wrong generation → fence rejects → entry stays
+                stale_owners.release(channel_id, owned_generation); // wrong gen
+                assert!(
+                    stale_owners.has_entry(channel_id),
+                    "F7b-handler stale-gen control: release with wrong generation must leave entry present"
+                );
+            }
+
+            // ── Wire server ────────────────────────────────────────────────────
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+            let conn_cancel = tokio_util::sync::CancellationToken::new();
+            let state_c = Arc::clone(&state);
+            let tenant_c = tenant.clone();
+            let assertion_c = assertion.clone();
+            let conn_cancel_c = conn_cancel.clone();
+
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("F7b-handler: bind listener");
+            let addr = listener.local_addr().expect("F7b-handler: local addr");
+
+            // Arm the after_add_peer hook — fires immediately after room.add_peer
+            // and before the B1 cancel check.
+            let (arrived_rx, release) =
+                crate::nip_fi_test_hooks::audio_add_peer_hook::arm(community);
+
+            let server = tokio::spawn(async move {
+                let app = axum::Router::new().route(
+                    "/",
+                    axum::routing::get({
+                        let state_i = Arc::clone(&state_c);
+                        let tenant_i = tenant_c.clone();
+                        let assertion_i = assertion_c.clone();
+                        let cancel_i = conn_cancel_c.clone();
+                        move |ws: axum::extract::ws::WebSocketUpgrade| {
+                            let state_i = Arc::clone(&state_i);
+                            let tenant_i = tenant_i.clone();
+                            let assertion_i = assertion_i.clone();
+                            let conn_time = chrono::Utc::now();
+                            let control_inner =
+                                crate::state::CommunityConnectionControl::new(cancel_i.clone());
+                            async move {
+                                ws.on_upgrade(move |socket| async move {
+                                    handle_active_audio_connection(
+                                        socket,
+                                        state_i,
+                                        tenant_i,
+                                        channel_id,
+                                        control_inner,
+                                        Some(assertion_i),
+                                        conn_time,
+                                        None,
+                                    )
+                                    .await
+                                })
+                            }
+                        }
+                    }),
+                );
+                let _ = ready_tx.send(());
+                axum::serve(listener, app).await.expect("test server");
+            });
+
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+                .await
+                .expect("F7b-handler: server ready");
+
+            let (mut client, _) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("F7b-handler: connect");
+
+            // Complete NIP-42 handshake.
+            let challenge_msg =
+                tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+                    .await
+                    .expect("F7b-handler: challenge timeout")
+                    .expect("F7b-handler: challenge message")
+                    .expect("F7b-handler: challenge ws message");
+            let challenge_text = match challenge_msg {
+                tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+                other => panic!("F7b-handler: expected text challenge; got {other:?}"),
+            };
+            let challenge_json: serde_json::Value =
+                serde_json::from_str(&challenge_text).expect("F7b-handler: challenge JSON");
+            let challenge = challenge_json["challenge"]
+                .as_str()
+                .expect("F7b-handler: challenge field")
+                .to_string();
+
+            let relay_url = format!("ws://{tenant_host}");
+            let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+                .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
+                .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+                .sign_with_keys(&key)
+                .unwrap();
+            let auth_msg = serde_json::json!({
+                "type": "auth",
+                "event": auth_event,
+                "parent_channel_id": null,
+                "protocol_version": 1,
+            })
+            .to_string();
+            client
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    auth_msg.into(),
+                ))
+                .await
+                .expect("F7b-handler: send auth");
+
+            // Wait for after_add_peer — peer is now in room, B1 check is next.
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+                .await
+                .expect("F7b-handler: handler must reach after_add_peer within 5s")
+                .expect("F7b-handler: arrived channel closed");
+
+            // Fire cancel — simulates mid-admission expiry at the B1 seam.
+            conn_cancel.cancel();
+
+            // Release hook — handler's B1 check fires, cleanup runs, then returns.
+            release.notify_one();
+
+            // Connection closes.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.next()).await;
+
+            // ── Assert: entry released ─────────────────────────────────────────
+            // Fix 7c moves owner_generation resolution to BEFORE the B1 cancel
+            // check. With it in place:
+            //   owner_generation = Some(77) at the B1 point
+            //   room_cleaned = true (single peer removed)
+            //   → mesh.owners.release(channel_id, 77) fires
+            //   → generation-fenced release succeeds (77 == 77)
+            //   → entry absent
+            //
+            // Mutation oracle: revert Fix 7c (move owner_generation lookup to after
+            // B1 check) → owner_generation is None at B1 → release skipped →
+            // entry still present → `has_entry` assertion panics.
+            assert!(
+                !state
+                    .mesh()
+                    .expect("F7b-handler: mesh must be set")
+                    .owners
+                    .has_entry(channel_id),
+                "F7b-handler: B1 exit must release owner registry entry with the correct pre-B1 \
+                 generation\n\
+                 Mutation oracle: revert Fix 7c (move owner_generation lookup to after B1 \
+                 check) → owner_generation = None → release skipped → entry present → panics"
+            );
+
+            server.abort();
+            let _ = server.await;
         }
 
         // ── F4b relay-membership denial wire frame ────────────────────────────
@@ -7734,7 +8034,9 @@ mod tests {
                 .unwrap();
             let auth_msg = serde_json::json!({"type": "auth", "event": auth_event}).to_string();
             client
-                .send(tokio_tungstenite::tungstenite::Message::Text(auth_msg.into()))
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    auth_msg.into(),
+                ))
                 .await
                 .expect("send auth");
 
@@ -7914,7 +8216,9 @@ mod tests {
                 .unwrap();
             let auth_msg = serde_json::json!({"type": "auth", "event": auth_event}).to_string();
             client
-                .send(tokio_tungstenite::tungstenite::Message::Text(auth_msg.into()))
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    auth_msg.into(),
+                ))
                 .await
                 .expect("send auth");
 
@@ -8175,7 +8479,9 @@ mod tests {
             })
             .to_string();
             client
-                .send(tokio_tungstenite::tungstenite::Message::Text(auth_msg.into()))
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    auth_msg.into(),
+                ))
                 .await
                 .expect("send auth");
 
