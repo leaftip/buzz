@@ -466,10 +466,12 @@ mod tests {
     //
     // Binding: both witnesses use a REAL gate with a past deadline (so
     // acquire_effect actually returns SessionExpired) and a REAL spawned expiry
-    // task (far-future deadline, waiting in its sleep arm).  Mutation: remove
-    // `expiry_deny_terminal` from the rejection sequence → terminal channel empty
-    // → assertion panics.  The test is sensitive to the production call site:
-    // deleting `expiry_deny_terminal` from audio/handler.rs breaks these tests.
+    // task (far-future deadline, waiting in its sleep arm).  These tests call
+    // `expiry_deny_terminal` DIRECTLY in the test body — they prove the primitive's
+    // ordering invariant (enqueue-before-cancel), not the handler's invocation of
+    // it.  Handler-bound wire delivery is proven in
+    // `postgres_tests::f4_add_peer_expired_delivers_denial_before_close` and
+    // `postgres_tests::f4_commit_expired_delivers_denial_before_close`.
     //
     // Mutation evidence (for both witnesses):
     //   A) Remove the `expiry_deny_terminal` call from the rejection sequence →

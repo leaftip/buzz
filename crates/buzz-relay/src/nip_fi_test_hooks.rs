@@ -328,3 +328,28 @@ make_hook!(
     audio_add_peer_gate_acquire_hook,
     before_add_peer_gate_acquire
 );
+
+// ── R2: room-ended error arm — admin fires before lifecycle_cancel ─────────
+// `before_room_ended_lifecycle_cancel`: fires in the `AdmissionError::Ended`
+// arm of `handle_active_audio_connection`, AFTER the room_ended error frame
+// is sent to the client but BEFORE `lifecycle_cancel()` is called.
+//
+// R2 test arms this hook, awaits arrival, then calls
+// `registry.disconnect_nip_fi` from the test (admin path: wins reason,
+// enqueues denial frame, fires cancel).  Releases the hook → handler calls
+// `lifecycle_cancel()` (loses reason, but cancel is set), awaits expiry,
+// then the R2 drain delivers the pre-queued denial frame + close.  The WS
+// client observes the denial frame + POLICY close after the room_ended error.
+//
+// Mutation evidence:
+//   A) Remove R2 drain from the Ended arm → denial queued but never sent →
+//      client never sees the denial frame → timeout after room_ended → panics.
+//   B) Delete `before_room_ended_lifecycle_cancel(...)` from handler →
+//      `arrived_rx` times out → test panics (proves hook is at the right seam).
+//   C) Move R2 drain to BEFORE guard.release_before_commit() → out-of-order
+//      delivery — but functionally equivalent; test checks frame ORDER, not
+//      guard timing.
+make_hook!(
+    audio_room_ended_lifecycle_cancel_hook,
+    before_room_ended_lifecycle_cancel
+);

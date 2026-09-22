@@ -1035,6 +1035,14 @@ pub(crate) async fn handle_active_audio_connection(
             Err(crate::audio::room::AdmissionError::Ended) => {
                 debug!(channel_id = %channel_id, "room ended before admission");
                 let _ = ws_send.send(WsMessage::Text(serde_json::json!({"type":"error","code":"room_ended","message":"huddle has ended"}).to_string().into())).await;
+                // Test hook: fires after the room_ended error frame is sent and
+                // before lifecycle_cancel.  Used by R2 witness: a concurrent admin
+                // disconnect fires here (wins reason, enqueues denial frame), then
+                // the R2 drain below delivers it before the socket closes.
+                // No-op in production.  [nip_fi_test_hooks::before_room_ended_lifecycle_cancel, R2]
+                #[cfg(test)]
+                crate::nip_fi_test_hooks::before_room_ended_lifecycle_cancel(tenant.community())
+                    .await;
                 // IMPORTANT 3: cancel + await expiry task before guard release.
                 // B2: lifecycle_cancel holds transition lock. [FI-TRACE-CANCEL-RACE, B2 fix]
                 control.lifecycle_cancel();
@@ -7788,6 +7796,250 @@ mod tests {
         let _ = server.await;
     }
 
+    // ── R2: room-ended admission error + concurrent admin deny → denial delivered ──
+    //
+    // Production path: `handle_active_audio_connection`, AdmissionError::Ended arm:
+    //   1. acquire_effect() → Ok (permit acquired)
+    //   2. add_peer()       → Err(Ended)             ← room pre-marked ended
+    //   3. ws_send.send(room_ended error frame)
+    //   4. [R2 hook fires here — admin fires denial]
+    //   5. control.lifecycle_cancel()                  ← loses reason (admin won)
+    //   6. R2 drain: terminal_ctrl_rx.try_recv() → denial frame → ws_send
+    //   7. ws_send.send(reason.close_message())        ← 1008 POLICY close
+    //
+    // The WS client observes:
+    //   frame 0: room_ended error JSON
+    //   frame 1: Audio restricted JSON (denial frame queued by admin in step 4)
+    //   frame 2: 1008 POLICY close
+    //
+    // Mutation evidence:
+    //   A) Remove R2 drain (`while let Ok(msg) = terminal_ctrl_rx.try_recv()`) →
+    //      admin denial is queued but never consumed → client never sees frame 1 →
+    //      timeout on frame-1 recv → test panics.
+    //   B) Delete `before_room_ended_lifecycle_cancel(...)` from handler →
+    //      `arrived_rx` times out → test panics (proves hook is at the right seam).
+    //   C) Remove `set_terminal_frame_sender` call from handler → admin's
+    //      `disconnect_nip_fi` finds no sender → nothing enqueued → frame 1 absent →
+    //      panics.
+    //
+    // Requires Postgres for `seed_audio_fixture` (channel/member row for membership check).
+    async fn r2_room_ended_concurrent_admin_delivers_denial_before_close_body() {
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+        use tokio_tungstenite::connect_async;
+
+        let state = audio_test_state_real_db()
+            .await
+            .expect("R2: DB must be available (test is marked #[ignore = \"requires Postgres\"])");
+        let pool = state.db.pool().clone();
+        let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
+        let community_id = tenant.community();
+
+        // Far-future deadline: expiry task is armed but does NOT fire during this test.
+        // The denial comes from the concurrent admin path, not expiry.
+        let assertion = VerifiedAssertion::for_test(
+            Some(member_key.public_key()),
+            vec![Utc::now() + Duration::hours(1)],
+        );
+
+        let pubkey_bytes = member_key.public_key().to_bytes().to_vec();
+
+        // Pre-mark the room as ended so add_peer returns AdmissionError::Ended.
+        // The room must exist in audio_rooms BEFORE the handler calls get_or_create;
+        // calling get_or_create and then marking it ended is equivalent.
+        let room = state.audio_rooms.get_or_create(community_id, channel_id);
+        room.mark_ended();
+
+        // Pre-create and register the control so state.community_connections can
+        // find this audio session by pubkey for the admin disconnect scan.
+        // audio_post_auth_register writes proven_pubkey on this same Arc after
+        // NIP-42 auth; the registered entry is updated in-place.
+        let conn_cancel = tokio_util::sync::CancellationToken::new();
+        let conn_control = crate::state::CommunityConnectionControl::new(conn_cancel.clone());
+        let conn_id = Uuid::new_v4();
+        let _conn_guard =
+            state
+                .community_connections
+                .register(conn_id, community_id, conn_control.clone());
+        let conn_control_for_server = conn_control.clone();
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("R2: bind test listener");
+        let addr = listener.local_addr().expect("R2: listener addr");
+
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    let control_outer = conn_control_for_server.clone();
+                    move |ws: axum::extract::WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let control_inner = control_outer.clone();
+                        let conn_time = chrono::Utc::now();
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    channel_id,
+                                    control_inner,
+                                    Some(assertion_i),
+                                    conn_time,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app).await.expect("R2: test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("R2: server ready");
+
+        // Arm the R2 hook BEFORE connecting so we capture the handler at the
+        // Ended error seam (after room_ended error sent, before lifecycle_cancel).
+        let (arrived_rx, hook_release) =
+            crate::nip_fi_test_hooks::audio_room_ended_lifecycle_cancel_hook::arm(community_id);
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("R2: connect client");
+
+        // NIP-42 auth exchange.
+        let challenge_msg = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("R2: challenge timeout")
+            .expect("R2: challenge item")
+            .expect("R2: challenge message");
+        let challenge_text = match challenge_msg {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("R2: expected text challenge; got {other:?}"),
+        };
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&challenge_text).expect("R2: challenge JSON");
+        let challenge = challenge_json["challenge"]
+            .as_str()
+            .expect("R2: challenge field")
+            .to_string();
+
+        let relay_url = "ws://test.local";
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&member_key)
+            .unwrap();
+        let auth_msg = serde_json::json!({"type": "auth", "event": auth_event}).to_string();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                auth_msg.into(),
+            ))
+            .await
+            .expect("R2: send auth");
+
+        // Wait for handler to reach before_room_ended_lifecycle_cancel.
+        // Handler has done: auth → membership → channel reads → add_peer (Ended) →
+        // room_ended error frame sent → HOOK fires.
+        tokio::time::timeout(std::time::Duration::from_secs(10), arrived_rx)
+            .await
+            .expect(
+                "R2: handler must reach before_room_ended_lifecycle_cancel within 10s \
+                 (proves hook is at the correct seam in the Ended arm)",
+            )
+            .expect("R2: hook arrived channel closed");
+
+        // Frame 0: room_ended error JSON (sent before the hook, so available now).
+        let frame0 = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("R2: frame 0 timeout")
+            .expect("R2: frame 0 item")
+            .expect("R2: frame 0 message");
+        match &frame0 {
+            tokio_tungstenite::tungstenite::Message::Text(t) => {
+                assert!(
+                    t.contains("room_ended"),
+                    "R2: frame 0 must be the room_ended error frame; got: {t}"
+                );
+            }
+            other => panic!("R2: frame 0 must be Text(room_ended error); got {other:?}"),
+        }
+
+        // Admin disconnect: fires while handler is held at the hook.
+        // CommunityConnectionControl::disconnect_nip_fi (via registry scan) enqueues
+        // the Audio denial frame on terminal_ctrl_tx, wins AuthorizationDenied,
+        // then calls cancel.cancel().
+        let closed = state.community_connections.disconnect_nip_fi(&pubkey_bytes);
+        assert_eq!(
+            closed, 1,
+            "R2: registry scan must find exactly 1 audio session \
+             (proves audio_post_auth_register ran before the hook)"
+        );
+
+        // Release hook → handler calls lifecycle_cancel (loses reason, but cancel
+        // is set), awaits expiry task, then R2 drain delivers the admin's denial
+        // frame + reason.close_message() (1008 POLICY).
+        hook_release.notify_one();
+
+        // Frame 1: Audio authorization-denied JSON (R2 drain delivers admin denial).
+        let frame1 = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .expect("R2: frame 1 timeout (denial frame must be delivered by R2 drain)")
+            .expect("R2: frame 1 item")
+            .expect("R2: frame 1 message");
+        let expected_restricted = serde_json::json!({
+            "type": "restricted",
+            "message": buzz_auth::DenialClass::AuthorizationDenied.nostr_text()
+        })
+        .to_string();
+        match &frame1 {
+            tokio_tungstenite::tungstenite::Message::Text(t) => assert_eq!(
+                t.as_str(),
+                expected_restricted.as_str(),
+                "R2: frame 1 must be the Audio restricted JSON denial frame \
+                 (proves R2 drain delivered the admin-queued denial). \
+                 Mutation A: remove R2 drain → this times out."
+            ),
+            other => panic!("R2: frame 1 must be Text(restricted JSON); got {other:?}"),
+        }
+
+        // Frame 2: 1008 POLICY close (reason.close_message() from AuthorizationDenied).
+        let frame2 = tokio::time::timeout(std::time::Duration::from_secs(3), client.next())
+            .await
+            .expect("R2: frame 2 timeout")
+            .expect("R2: frame 2 item")
+            .expect("R2: frame 2 message");
+        match &frame2 {
+            tokio_tungstenite::tungstenite::Message::Close(Some(cf)) => {
+                assert_eq!(
+                    cf.code,
+                    tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                    "R2: close code must be 1008 POLICY; got {:?}",
+                    cf.code
+                );
+            }
+            other => panic!("R2: frame 2 must be Close(Some(1008 POLICY)); got {other:?}"),
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
+
     mod postgres_tests {
         /// F3: lifecycle_generation committed in kind-48101 JOIN matches the relay's
         /// global liveness generation (the same value `handle_huddle_liveness_req`
@@ -7821,6 +8073,17 @@ mod tests {
         #[ignore = "requires Postgres"]
         async fn f4_commit_expired_delivers_denial_before_close() {
             super::f4_commit_expired_delivers_denial_before_close_body().await;
+        }
+
+        /// R2: room-ended admission error racing concurrent admin deny → R2 drain delivers
+        /// denial frame + 1008 POLICY close after the room_ended error frame.
+        ///
+        /// Discoverable by the PostgreSQL Tests CI lane (requires `seed_audio_fixture`
+        /// for the membership DB check in `handle_active_audio_connection`).
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn r2_room_ended_concurrent_admin_delivers_denial_before_close() {
+            super::r2_room_ended_concurrent_admin_delivers_denial_before_close_body().await;
         }
     }
 }
