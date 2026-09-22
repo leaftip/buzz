@@ -1142,6 +1142,9 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
     /// same authoritative room-empty teardown as the local owner WebSocket
     /// path. The owner-registry release is generation-fenced, so a late close
     /// from an old stream cannot cancel a newly acquired lease epoch.
+    ///
+    /// **Only call for committed peers.** For pending (uncommitted) slots use
+    /// [`Self::remove_remote_peer_pending`].
     fn remove_remote_peer(
         &self,
         community: CommunityId,
@@ -1156,6 +1159,27 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
             return;
         };
         broadcast_peer_left(&room, delta, session_id);
+        if should_end && self.rooms.cleanup_if_empty(community, session_id) {
+            self.owners.release(session_id, generation);
+        }
+    }
+
+    /// Like [`Self::remove_remote_peer`] but for pending (uncommitted) slots.
+    /// No delta is broadcast; no revision bump. The room-empty / lease-release
+    /// logic still runs so an empty room whose only peer was pending does not
+    /// linger.
+    /// [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
+    fn remove_remote_peer_pending(
+        &self,
+        community: CommunityId,
+        session_id: Uuid,
+        generation: u64,
+        peer_id: Uuid,
+    ) {
+        let Some(room) = self.rooms.get(community, session_id) else {
+            return;
+        };
+        let (_, should_end) = room.remove_peer_silent_and_check_ended(peer_id);
         if should_end && self.rooms.cleanup_if_empty(community, session_id) {
             self.owners.release(session_id, generation);
         }
@@ -1363,17 +1387,27 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
                 }
                 HuddleControlMsg::UnregisterPeer { pubkey } => {
                     // Peer may be pending (commit not yet received) or
-                    // committed. Remove from whichever map holds it.
-                    let peer_id = registered
-                        .remove(&pubkey)
-                        .or_else(|| pending_registered.remove(&pubkey));
-                    if let (Some(peer_id), Some(community_id)) = (peer_id, stream_community) {
-                        self.remove_remote_peer(
-                            CommunityId::from_uuid(community_id),
-                            session_id,
-                            fenced.generation,
-                            peer_id,
-                        );
+                    // committed. Remove from whichever map holds it, using
+                    // the correct removal path to preserve the invariant:
+                    // committed → emits left delta; pending → silent removal.
+                    if let Some(peer_id) = registered.remove(&pubkey) {
+                        if let Some(community_id) = stream_community {
+                            self.remove_remote_peer(
+                                CommunityId::from_uuid(community_id),
+                                session_id,
+                                fenced.generation,
+                                peer_id,
+                            );
+                        }
+                    } else if let Some(peer_id) = pending_registered.remove(&pubkey) {
+                        if let Some(community_id) = stream_community {
+                            self.remove_remote_peer_pending(
+                                CommunityId::from_uuid(community_id),
+                                session_id,
+                                fenced.generation,
+                                peer_id,
+                            );
+                        }
                     }
                 }
                 HuddleControlMsg::CommitConfirmed { pubkey } => {
@@ -1465,9 +1499,10 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
             }
             // Pending peers (commit never arrived): remove silently.
             // They were never visible — no `joined` was published.
+            // Using remove_remote_peer_pending so no delta/revision bump fires.
             // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
             for (_pubkey, peer_id) in pending_registered {
-                self.remove_remote_peer(community, session_id, fenced.generation, peer_id);
+                self.remove_remote_peer_pending(community, session_id, fenced.generation, peer_id);
             }
         }
         result

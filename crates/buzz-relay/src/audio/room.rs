@@ -442,6 +442,10 @@ impl Room {
 
     /// Remove a peer and release its routing identity for a later allocator
     /// rotation. Returns the ordered roster delta when the peer existed.
+    ///
+    /// **Only call this for committed peers.** For pending (uncommitted) slots
+    /// use [`Self::remove_peer_silent`] — calling this on a pending peer emits
+    /// a phantom `left` delta for a join that was never published.
     pub fn remove_peer(&self, peer_id: Uuid) -> Option<RosterDelta> {
         let Ok(mut g) = self.guard.lock() else {
             return None;
@@ -461,6 +465,30 @@ impl Room {
         let _ = self.roster_tx.send(delta.clone());
         drop(g);
         Some(delta)
+    }
+
+    /// Remove a pending (uncommitted) peer slot without emitting any roster
+    /// delta or bumping the revision. Use on every rollback/teardown path for
+    /// peers whose admission was never published (i.e. [`Self::commit_peer`]
+    /// was never called for this `peer_id`).
+    ///
+    /// Because `add_peer_pending` made no revision bump, the slot is invisible
+    /// to observers; this removal must also be invisible.
+    ///
+    /// Returns `true` when the slot existed and was removed, `false` if the
+    /// peer was not found (safe no-op — already removed elsewhere).
+    /// [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
+    pub fn remove_peer_silent(&self, peer_id: Uuid) -> bool {
+        let Ok(mut g) = self.guard.lock() else {
+            return false;
+        };
+        let Some((_, peer)) = self.peers.remove(&peer_id) else {
+            return false;
+        };
+        // Free the index so it can be reallocated (rotated, as usual).
+        g.active_indices.remove(&peer.peer_index);
+        // No roster_revision bump, no roster_tx send — the peer was pending.
+        true
     }
 
     /// Add a peer without publishing the admission. Returns
@@ -640,6 +668,9 @@ impl Room {
     /// acquisition that removes the peer — no window for a concurrent
     /// `add_peer` to sneak in between removal and the ended flag.
     /// Returns `(roster_delta, should_auto_end)`.
+    ///
+    /// **Only call this for committed peers.** For pending slots use
+    /// [`Self::remove_peer_silent_and_check_ended`].
     pub fn remove_peer_and_check_ended(&self, peer_id: Uuid) -> Option<(RosterDelta, bool)> {
         let mut g = self.guard.lock().ok()?;
         let (_, peer) = self.peers.remove(&peer_id)?;
@@ -667,6 +698,32 @@ impl Room {
         let _ = self.roster_tx.send(delta.clone());
         drop(g);
         Some((delta, should_end))
+    }
+
+    /// Like [`Self::remove_peer_silent`] but also atomically checks if the
+    /// room should end (no committed peers remain). Used on teardown paths
+    /// for pending slots where the room may become empty without ever having
+    /// had a visible participant.
+    ///
+    /// No delta is emitted; the revision is not bumped.
+    /// Returns `(existed, should_auto_end)`.
+    /// [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
+    pub fn remove_peer_silent_and_check_ended(&self, peer_id: Uuid) -> (bool, bool) {
+        let Ok(mut g) = self.guard.lock() else {
+            return (false, false);
+        };
+        let Some((_, peer)) = self.peers.remove(&peer_id) else {
+            return (false, false);
+        };
+        g.active_indices.remove(&peer.peer_index);
+        // No revision bump, no delta.
+        let should_end = if !g.ended && self.peers.is_empty() {
+            g.ended = true;
+            true
+        } else {
+            false
+        };
+        (true, should_end)
     }
 
     /// Fan-out a binary frame to all peers except the sender. Protocol v3
@@ -1264,22 +1321,20 @@ mod tests {
     //     RED (revision does not advance past snapshot value).
 
     /// Fix-B witness 1: a pending peer removed before `commit_peer` emits NO
-    /// joined delta.  This covers the remote failure path: ingress rolls back
-    /// → stream closes → teardown calls `remove_peer` on the pending slot →
-    /// the slot was never visible.
+    /// delta of any kind — no joined, no left. This covers the remote failure
+    /// path: ingress rolls back → stream closes → teardown calls
+    /// `remove_peer_silent` on the pending slot → the slot was never visible.
     ///
     /// Mutation oracle: publish at registration (swap to `add_peer`) → RED —
-    /// the delta is in the channel before `remove_peer` and `try_recv` finds
-    /// it.
+    /// a joined delta is in the channel before the removal and `try_recv`
+    /// finds it.
     #[test]
-    fn b1_pending_peer_removed_before_commit_emits_no_joined_delta() {
+    fn b1_pending_peer_removed_before_commit_emits_no_delta() {
         let room = fresh_room();
         // Subscribe before any mutation so we observe everything.
         let mut deltas = room.subscribe_roster();
 
-        // Add Alice (committed) so the room is non-empty — makes sure a
-        // pending peer's removal does not accidentally fire a leave delta
-        // that pollutes the channel before our assertion.
+        // Add Alice (committed) so the room is non-empty.
         let (alice_id, ..) = room.add_peer("alice".into(), 2).unwrap();
         room.mark_committed(alice_id);
         // Drain alice's joined delta.
@@ -1288,26 +1343,14 @@ mod tests {
         // Add Bob as pending (remote-path deferral).
         let (bob_id, ..) = room.add_peer_pending("bob".into(), 2).unwrap();
 
-        // Simulate rollback: remove the pending slot before any commit.
-        room.remove_peer(bob_id).expect("pending peer exists");
+        // Simulate rollback: remove the pending slot silently (Fix-B path).
+        room.remove_peer_silent(bob_id);
 
-        // No joined delta for Bob must have been emitted: the next event in the
-        // channel must be Bob's leave delta (revision bump from remove_peer),
-        // with `joined == None`.  There must be no event with `joined == Some`.
-        let leave = deltas.try_recv().expect("leave delta expected");
-        assert!(
-            leave.joined.is_none(),
-            "remove of pending peer must emit leave-only delta, got joined={:?}",
-            leave.joined
-        );
-        assert!(
-            leave.left.as_ref().map(|p| p.pubkey.as_str()) == Some("bob"),
-            "leave delta must name the pending peer"
-        );
-        // Channel must now be empty — no spurious joined delta was buffered.
+        // The delta channel must be completely empty — no joined AND no left
+        // for Bob. Bob was never visible; his removal must be invisible too.
         assert!(
             deltas.try_recv().is_err(),
-            "no additional delta must follow a pending-peer removal"
+            "remove_peer_silent on a pending peer must emit NO delta of any kind"
         );
     }
 

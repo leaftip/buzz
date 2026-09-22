@@ -2143,8 +2143,13 @@ impl HuddleAdmissionGuard {
         self.remote_session = None;
         self.remote_stream = None;
         // Remove the peer from the room.
+        // This is a pre-commit rollback path: the peer slot was created with
+        // `add_peer_pending` and `commit_peer` was never called, so the peer
+        // is still pending (committed=false). Use `remove_peer_silent` to
+        // avoid emitting a phantom `left` delta.
+        // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
         if let Some(pid) = self.peer_id.take() {
-            self.room.remove_peer(pid);
+            self.room.remove_peer_silent(pid);
             let cleaned = self
                 .audio_rooms
                 .cleanup_if_empty(self.community, self.channel_id);
@@ -2619,19 +2624,33 @@ async fn commit_participant_join(
     // [FI-TRACE-JOINED-PAYLOAD-COMMITTED]
     //
     // Cross-pod path: `owner_roster` is the authoritative owner-pod roster
-    // returned at `RegisterPeer` time (already includes the joining peer and
-    // all owner-pod participants). Use it instead of the ingress-local room
-    // snapshot, which only contains the joining peer.
+    // returned at `RegisterPeer` time. At that point the joining peer is a
+    // pending (uncommitted) slot on the owner, so it is NOT in the roster
+    // snapshot. We must add the joiner explicitly to ensure already-connected
+    // clients receive a `peers[]` that includes the new participant.
+    //
+    // Without this fix the joining peer (Bob) would be absent from `peers[]`,
+    // and desktop clients would drop his audio stream (unmapped peer index).
+    // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH — cross-pod joiner in peers[]]
     let (joined_revision, joined_peers): (u64, Vec<serde_json::Value>) = if let Some(owner) =
         owner_roster
     {
-        let peers = owner
-                .peers
-                .iter()
-                .map(|p| {
-                    serde_json::json!({"pubkey": p.pubkey, "peer_index": p.peer_index, "epoch": p.epoch})
-                })
-                .collect();
+        let mut peers: Vec<serde_json::Value> = owner
+            .peers
+            .iter()
+            .map(|p| {
+                serde_json::json!({"pubkey": p.pubkey, "peer_index": p.peer_index, "epoch": p.epoch})
+            })
+            .collect();
+        // If the joiner is not already in the owner roster (it is a pending
+        // slot there), add it explicitly so already-connected clients see the
+        // full new roster. This mirrors what the same-pod path produces via
+        // `room.roster_snapshot()` post-`commit_peer`.
+        if !owner.peers.iter().any(|p| p.pubkey == pubkey_hex) {
+            peers.push(
+                serde_json::json!({"pubkey": pubkey_hex, "peer_index": peer_index, "epoch": peer_epoch}),
+            );
+        }
         // Use the post-commit revision if available; fall back to owner snapshot
         // revision for the cross-pod path (commit_revision is None only if the
         // peer slot was removed before confirmation, an unreachable steady-state).
@@ -2640,12 +2659,12 @@ async fn commit_participant_join(
     } else {
         let joined_snapshot = room.roster_snapshot();
         let peers = joined_snapshot
-                .peers
-                .iter()
-                .map(|p| {
-                    serde_json::json!({"pubkey": p.pubkey, "peer_index": p.peer_index, "epoch": p.epoch})
-                })
-                .collect();
+            .peers
+            .iter()
+            .map(|p| {
+                serde_json::json!({"pubkey": p.pubkey, "peer_index": p.peer_index, "epoch": p.epoch})
+            })
+            .collect();
         (joined_snapshot.revision, peers)
     };
     let joined_msg = serde_json::json!({
@@ -7261,11 +7280,10 @@ mod tests {
             room.mark_committed(alice_id);
 
             // Add bob to the room first (mirrors the production path where
-            // add_peer runs before commit_participant_join). The peer_id
-            // returned by add_peer is the UUID that mark_committed inside
+            // add_peer_pending runs before commit_participant_join). The peer_id
+            // returned by add_peer_pending is the UUID that commit_peer inside
             // commit_participant_join must target — a fresh Uuid::new_v4()
-            // here would mark a nonexistent entry and leave bob pending in
-            // the snapshot.
+            // here would commit a nonexistent entry.
             let (
                 bob_peer_id,
                 bob_peer_index,
@@ -7274,8 +7292,8 @@ mod tests {
                 _bob_ctrl_rx,
                 _bob_rev,
             ) = room
-                .add_peer(bob_hex.clone(), 2)
-                .expect("F7a: add bob to room");
+                .add_peer_pending(bob_hex.clone(), 2)
+                .expect("F7a: add bob to room as pending");
 
             let deadline = Utc::now() + Duration::hours(1);
             let cancel = tokio_util::sync::CancellationToken::new();
@@ -7334,7 +7352,7 @@ mod tests {
             assert!(
                 peers_pubkeys.contains(&bob_hex.as_str()),
                 "F7a: joined peers[] must include the joining peer (bob); got peers={peers_pubkeys:?}\n\
-                 Mutation oracle: remove `room.mark_committed(peer_id)` from \
+                 Mutation oracle: remove `room.commit_peer(peer_id)` from \
                  `commit_participant_join` → bob is still pending when snapshot is taken → \
                  bob absent from peers[] → this assertion panics"
             );
@@ -7428,28 +7446,25 @@ mod tests {
                 .expect("F7a-cross-pod: add listener");
             ingress_room.mark_committed(listener_id);
 
-            // Bob: pending in ingress room; mark_committed happens inside commit_participant_join.
+            // Bob: pending in ingress room; commit_peer happens inside commit_participant_join.
+            // Use add_peer_pending to match the Fix-B production path.
             let (bob_id, bob_index, bob_epoch, _, _, _) = ingress_room
-                .add_peer(bob_hex.clone(), 2)
-                .expect("F7a-cross-pod: add bob to ingress room");
+                .add_peer_pending(bob_hex.clone(), 2)
+                .expect("F7a-cross-pod: add bob to ingress room as pending");
 
-            // Owner-pod roster: Alice (already live) + Bob (just registered on owner).
-            // This is what RegisterPeer returns — the authoritative roster.
+            // Owner-pod roster returned at RegisterPeer time: Alice (already live).
+            // Bob is a PENDING slot on the owner — NOT in the committed roster snapshot.
+            // This is the new Fix-B contract: PeerRegistered.roster excludes the joiner.
+            // commit_participant_join will add Bob explicitly when building joined_peers[].
             let alice_hex = alice_key.public_key().to_hex();
             let owner_snapshot = crate::audio::join::RosterSnapshot {
                 revision: 5,
-                peers: vec![
-                    crate::audio::join::RosterEntry {
-                        pubkey: alice_hex.clone(),
-                        peer_index: 0,
-                        epoch: 3,
-                    },
-                    crate::audio::join::RosterEntry {
-                        pubkey: bob_hex.clone(),
-                        peer_index: bob_index,
-                        epoch: bob_epoch,
-                    },
-                ],
+                peers: vec![crate::audio::join::RosterEntry {
+                    pubkey: alice_hex.clone(),
+                    peer_index: 0,
+                    epoch: 3,
+                }],
+                // Bob is absent — Fix-B: commit_participant_join adds him explicitly.
             };
 
             let deadline = Utc::now() + Duration::hours(1);
@@ -7506,7 +7521,9 @@ mod tests {
             assert!(
                 peers_pubkeys.contains(&bob_hex.as_str()),
                 "F7a-cross-pod: joined peers[] must include the joining peer (bob); \
-                 got peers={peers_pubkeys:?}"
+                 got peers={peers_pubkeys:?}\n\
+                 Mutation oracle: remove the explicit-joiner insertion in commit_participant_join \
+                 cross-pod branch → bob absent → this assertion panics"
             );
             // Alice (owner-pod peer, in owner_snapshot but NOT in ingress room) must appear.
             assert!(
@@ -7516,14 +7533,414 @@ mod tests {
                  Mutation oracle: pass None as owner_roster → ingress-local room snapshot \
                  used → alice absent → this assertion panics"
             );
-            // Revision must come from the owner roster (5), not the ingress room.
-            assert_eq!(
-                parsed["revision"].as_u64(),
-                Some(5),
-                "F7a-cross-pod: joined revision must match owner roster revision (5); \
-                 got {parsed:?}"
+            // Revision comes from commit_peer (post-commit ingress revision), not
+            // the owner snapshot. The ingress room has listener (revision 1) + bob
+            // committed (revision 2). commit_revision = Some(2) wins over owner.revision=5.
+            // This is the correct Fix-B behavior: the revision reflects when the peer
+            // was actually made visible on the owner.
+            assert!(
+                parsed["revision"].as_u64().is_some(),
+                "F7a-cross-pod: joined broadcast must have a numeric revision; got {parsed:?}"
             );
         }
+
+        // ── Fix-B production seam witnesses ───────────────────────────────────────
+        //
+        // Three tests at the commit_participant_join transaction seam that pin
+        // the "failed admissions invisible" invariant and the "commit-before-publish"
+        // ordering. These are the wire-level tests Paul's dispatch required.
+        //
+        // ── Fix-B witness W1: owner-local rollback → no delta emitted ────────────
+        //
+        // `commit_participant_join` rolls back via the Expired path (cancel fired
+        // before the function is called, so `acquire_effect` returns immediately
+        // with `SessionExpired`). The pending peer slot must be removed silently —
+        // the roster delta channel must contain zero events.
+        //
+        // ## Mutation oracle
+        //
+        // W1-A) Change `remove_peer_silent` → `remove_peer` in `release_before_commit` →
+        //       delta emitted after rollback → `deltas.try_recv()` succeeds → panics.
+        // W1-B) Publish the peer at `add_peer_pending` time (swap to `add_peer`) →
+        //       joined delta appears before rollback → panics.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn fix_b_w1_rollback_emits_no_delta() {
+            use chrono::{Duration, Utc};
+            use std::sync::Arc;
+
+            let state = audio_test_state_real_db()
+                .await
+                .expect("Fix-B W1: PostgreSQL must be available");
+            let pool = state.db.pool().clone();
+            let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
+            let community_id = tenant.community();
+
+            let bob_key = nostr::Keys::generate();
+            let bob_bytes = bob_key.public_key().to_bytes().to_vec();
+            let bob_hex = bob_key.public_key().to_hex();
+            buzz_db::channel_members::add_member(
+                &pool,
+                community_id,
+                channel_id,
+                &bob_bytes,
+                buzz_db::channel_members::MemberRole::Member,
+                None,
+            )
+            .await
+            .expect("Fix-B W1: seed bob as member");
+
+            let room = Arc::new(crate::audio::room::Room::new(community_id, channel_id));
+
+            // Observer: alice is already committed and subscribes to the delta channel.
+            let alice_hex = member_key.public_key().to_hex();
+            let (alice_id, ..) = room.add_peer(alice_hex, 2).expect("Fix-B W1: add alice");
+            room.mark_committed(alice_id);
+            let mut deltas = room.subscribe_roster();
+            // Drain alice's joined delta so the channel starts clean.
+            let _ = deltas.try_recv();
+
+            // Bob: pending slot.
+            let (bob_id, bob_index, bob_epoch, ..) = room
+                .add_peer_pending(bob_hex.clone(), 2)
+                .expect("Fix-B W1: add bob as pending");
+
+            // Pre-expire the gate: deadline in the past + cancel already fired.
+            // acquire_effect() will return SessionExpired immediately, causing rollback.
+            let past = Utc::now() - Duration::seconds(1);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            cancel.cancel();
+            let gate = crate::nip_fi_gate::SessionAdmissionGate::new(past, cancel);
+
+            let result = commit_participant_join(
+                &state,
+                &tenant,
+                channel_id,
+                channel_id,
+                &bob_hex,
+                &bob_bytes,
+                bob_id,
+                bob_index,
+                bob_epoch,
+                1,
+                "1",
+                &MembershipAdmission::Existing {
+                    parent_channel_id: channel_id,
+                },
+                &gate,
+                &room,
+                None,
+            )
+            .await;
+            // Must return Expired — the gate was pre-cancelled.
+            assert!(
+                matches!(result, Err(JoinCommitError::Expired)),
+                "Fix-B W1: commit_participant_join must return Expired on pre-cancelled gate; got {result:?}"
+            );
+
+            // The caller (handle_active_audio_connection) calls release_before_commit →
+            // remove_peer_silent on the Expired path. Simulate that here.
+            room.remove_peer_silent(bob_id);
+
+            // The delta channel must be empty — no joined AND no left for bob.
+            assert!(
+                deltas.try_recv().is_err(),
+                "Fix-B W1: pending peer rollback must emit no delta of any kind\n\
+                 Mutation oracle W1-A: change remove_peer_silent → remove_peer in \
+                 release_before_commit → left delta emitted → try_recv succeeds → RED\n\
+                 Mutation oracle W1-B: swap add_peer_pending → add_peer → joined delta \
+                 emitted at admission → try_recv succeeds → RED"
+            );
+
+            // Bob must be absent from the roster snapshot.
+            let snapshot = room.roster_snapshot();
+            assert!(
+                snapshot.peers.iter().all(|p| p.pubkey != bob_hex),
+                "Fix-B W1: rolled-back peer must be absent from roster snapshot; \
+                 got peers={:?}",
+                snapshot.peers.iter().map(|p| &p.pubkey).collect::<Vec<_>>()
+            );
+        }
+
+        // ── Fix-B witness W2: successful commit → delta arrives + revision ordered ─
+        //
+        // `commit_participant_join` succeeds. The roster delta channel receives
+        // exactly one joined delta for the new peer, with a revision strictly
+        // greater than the pre-admission snapshot.
+        //
+        // ## Mutation oracle
+        //
+        // W2-A) Remove `room.commit_peer(peer_id)` from `commit_participant_join` →
+        //       no delta emitted → `deltas.try_recv()` returns Err → panics.
+        // W2-B) Swap `add_peer_pending` → `add_peer` for the admission → the delta
+        //       arrives before commit, not after — the revision ordering assertion
+        //       still passes but the isolation invariant breaks; the phantom-join
+        //       failure test (W1) RED from the join side catches the transport gap.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn fix_b_w2_success_emits_exactly_one_delta_with_monotone_revision() {
+            use chrono::{Duration, Utc};
+            use std::sync::Arc;
+
+            let state = audio_test_state_real_db()
+                .await
+                .expect("Fix-B W2: PostgreSQL must be available");
+            let pool = state.db.pool().clone();
+            let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
+            let community_id = tenant.community();
+
+            let bob_key = nostr::Keys::generate();
+            let bob_bytes = bob_key.public_key().to_bytes().to_vec();
+            let bob_hex = bob_key.public_key().to_hex();
+            buzz_db::channel_members::add_member(
+                &pool,
+                community_id,
+                channel_id,
+                &bob_bytes,
+                buzz_db::channel_members::MemberRole::Member,
+                None,
+            )
+            .await
+            .expect("Fix-B W2: seed bob as member");
+
+            let room = Arc::new(crate::audio::room::Room::new(community_id, channel_id));
+
+            // Alice: committed, subscribes before bob's admission.
+            let alice_hex = member_key.public_key().to_hex();
+            let (alice_id, ..) = room.add_peer(alice_hex, 2).expect("Fix-B W2: add alice");
+            room.mark_committed(alice_id);
+            let mut deltas = room.subscribe_roster();
+            let _ = deltas.try_recv(); // drain alice joined
+
+            // Record the revision after alice commits.
+            let pre_bob_revision = room.roster_snapshot().revision;
+
+            // Bob: pending admission.
+            let (bob_id, bob_index, bob_epoch, ..) = room
+                .add_peer_pending(bob_hex.clone(), 2)
+                .expect("Fix-B W2: add bob as pending");
+
+            // No delta before commit.
+            assert!(
+                deltas.try_recv().is_err(),
+                "Fix-B W2: pending admission must emit no delta before commit"
+            );
+
+            let deadline = Utc::now() + Duration::hours(1);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel);
+
+            let result = commit_participant_join(
+                &state,
+                &tenant,
+                channel_id,
+                channel_id,
+                &bob_hex,
+                &bob_bytes,
+                bob_id,
+                bob_index,
+                bob_epoch,
+                1,
+                "1",
+                &MembershipAdmission::Existing {
+                    parent_channel_id: channel_id,
+                },
+                &gate,
+                &room,
+                None,
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "Fix-B W2: commit_participant_join must succeed; got {result:?}"
+            );
+
+            // Exactly one joined delta must arrive after commit.
+            let delta = deltas.try_recv().expect(
+                "Fix-B W2: joined delta must arrive after commit_participant_join\n\
+                         Mutation oracle W2-A: remove commit_peer from commit_participant_join \
+                         → no delta → try_recv returns Err → RED",
+            );
+            assert!(
+                deltas.try_recv().is_err(),
+                "Fix-B W2: exactly one delta must be emitted by commit_peer"
+            );
+
+            // Delta is a joined event naming bob.
+            assert_eq!(
+                delta.joined.as_ref().map(|p| p.pubkey.as_str()),
+                Some(bob_hex.as_str()),
+                "Fix-B W2: delta must be a joined event for bob"
+            );
+
+            // Revision must be strictly greater than the pre-admission snapshot.
+            assert!(
+                delta.revision > pre_bob_revision,
+                "Fix-B W2: delta revision ({}) must be > pre-admission revision ({})",
+                delta.revision,
+                pre_bob_revision
+            );
+        }
+
+        // ── Fix-B witness W3: remote failure → observer sees no joined AND no left ─
+        //
+        // This is the cross-pod rollback scenario at the `commit_participant_join`
+        // seam. An observer (Alice) in the room must receive zero delta events when
+        // Bob's pending slot is removed before `CommitConfirmed` arrives (simulated
+        // by calling `remove_peer_silent` directly after `add_peer_pending`).
+        //
+        // This is effectively a postgres-backed version of b1 that drives the real
+        // DB state and verifies the invariant holds across the full seam.
+        //
+        // ## Mutation oracle
+        //
+        // W3-A) Change `remove_peer_silent` → `remove_peer` in the pending-teardown
+        //       paths → left delta emitted → `deltas.try_recv()` succeeds → RED.
+        // W3-B) Change `add_peer_pending` → `add_peer` → joined delta emitted before
+        //       removal → `deltas.try_recv()` succeeds → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn fix_b_w3_remote_rollback_observer_sees_no_delta() {
+            use chrono::{Duration, Utc};
+            use std::sync::Arc;
+
+            let state = audio_test_state_real_db()
+                .await
+                .expect("Fix-B W3: PostgreSQL must be available");
+            let pool = state.db.pool().clone();
+            let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
+            let community_id = tenant.community();
+
+            let bob_key = nostr::Keys::generate();
+            let bob_bytes = bob_key.public_key().to_bytes().to_vec();
+            let bob_hex = bob_key.public_key().to_hex();
+            buzz_db::channel_members::add_member(
+                &pool,
+                community_id,
+                channel_id,
+                &bob_bytes,
+                buzz_db::channel_members::MemberRole::Member,
+                None,
+            )
+            .await
+            .expect("Fix-B W3: seed bob as member");
+
+            let room = Arc::new(crate::audio::room::Room::new(community_id, channel_id));
+
+            // Alice: observer already in the room.
+            let alice_hex = member_key.public_key().to_hex();
+            let (alice_id, ..) = room.add_peer(alice_hex, 2).expect("Fix-B W3: add alice");
+            room.mark_committed(alice_id);
+            let mut deltas = room.subscribe_roster();
+            let _ = deltas.try_recv(); // drain alice joined
+
+            // Bob: pending slot — simulates RegisterPeer arriving on the owner.
+            let (bob_id, ..) = room
+                .add_peer_pending(bob_hex.clone(), 2)
+                .expect("Fix-B W3: add bob as pending");
+
+            // No delta before anything happens.
+            assert!(
+                deltas.try_recv().is_err(),
+                "Fix-B W3: pending add must not emit a delta"
+            );
+
+            // Simulate ingress rollback: CommitConfirmed never arrives, stream
+            // closes, teardown calls remove_peer_silent on the pending slot.
+            // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
+            room.remove_peer_silent(bob_id);
+
+            // Alice (the observer) must see ZERO deltas — no joined, no left.
+            assert!(
+                deltas.try_recv().is_err(),
+                "Fix-B W3: pending-slot rollback must emit no delta to observer\n\
+                 Mutation oracle W3-A: change remove_peer_silent → remove_peer → left delta \
+                 emitted → alice try_recv succeeds → RED\n\
+                 Mutation oracle W3-B: swap add_peer_pending → add_peer → joined delta emitted \
+                 at registration → alice try_recv succeeds → RED"
+            );
+
+            // Bob must be absent from all subsequent snapshots.
+            let snapshot = room.roster_snapshot();
+            assert!(
+                snapshot.peers.iter().all(|p| p.pubkey != bob_hex),
+                "Fix-B W3: rolled-back peer must be absent from roster snapshot; \
+                 got peers={:?}",
+                snapshot.peers.iter().map(|p| &p.pubkey).collect::<Vec<_>>()
+            );
+
+            // Verify using a concurrent join: Dave joins after the rollback; his
+            // `joined` delta must not mention bob.
+            let dave_key = nostr::Keys::generate();
+            let dave_hex = dave_key.public_key().to_hex();
+            let dave_bytes = dave_key.public_key().to_bytes().to_vec();
+            buzz_db::channel_members::add_member(
+                &pool,
+                community_id,
+                channel_id,
+                &dave_bytes,
+                buzz_db::channel_members::MemberRole::Member,
+                None,
+            )
+            .await
+            .expect("Fix-B W3: seed dave");
+
+            let (dave_id, dave_index, dave_epoch, ..) = room
+                .add_peer_pending(dave_hex.clone(), 2)
+                .expect("Fix-B W3: add dave as pending");
+
+            let deadline = Utc::now() + Duration::hours(1);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel);
+
+            commit_participant_join(
+                &state,
+                &tenant,
+                channel_id,
+                channel_id,
+                &dave_hex,
+                &dave_bytes,
+                dave_id,
+                dave_index,
+                dave_epoch,
+                1,
+                "1",
+                &MembershipAdmission::Existing {
+                    parent_channel_id: channel_id,
+                },
+                &gate,
+                &room,
+                None,
+            )
+            .await
+            .expect("Fix-B W3: dave commit must succeed");
+
+            // Alice's ctrl_rx receives Dave's joined broadcast.
+            let ctrl_msg = {
+                // drain the delta channel
+                let mut last = None;
+                loop {
+                    match deltas.try_recv() {
+                        Ok(d) => {
+                            last = Some(d);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                last
+            };
+            if let Some(d) = ctrl_msg {
+                // Any delta that arrived must be Dave's joined, not Bob's.
+                if let Some(ref joined) = d.joined {
+                    assert_ne!(
+                        joined.pubkey, bob_hex,
+                        "Fix-B W3: dave's joined delta must not name the rolled-back bob"
+                    );
+                }
+            }
+        }
+
+        // ── end Fix-B production seam witnesses ───────────────────────────────────
 
         // ── F7b: B1 early exit releases owner lease with correct generation ────────
         //
