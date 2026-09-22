@@ -177,13 +177,11 @@ impl CommunityConnectionControl {
             Some(_) => false,
         });
         // Test-only hook: fires after winning reason publication but before
-        // try_send, while the transition lock is held.  Allows a concurrent
-        // disconnect_community to race into its own lock acquisition (where it
-        // blocks in the fixed code) so the test can prove community's cancel
-        // cannot fire before the winning enqueue completes.
+        // try_send, while the transition lock is held.  Keyed by hook_key so
+        // concurrent tests never share a callback slot.
         // Zero-cost in production.  [FI-TRACE-CANCEL-RACE, W_pairing_cancel_race]
         #[cfg(test)]
-        pairing_race_test_hook::fire_after_reason_win();
+        pairing_race_test_hook::fire_after_reason_win(self.hook_key);
         if won {
             let _ = frame_tx.try_send(crate::nip_fi_session::authorization_denied_frame(route));
         }
@@ -219,13 +217,11 @@ impl CommunityConnectionControl {
             Some(_) => false,
         });
         // Test-only hook: fires after winning reason publication but before
-        // try_send, while the transition lock is held.  Allows a concurrent
-        // disconnect_community to race into its own lock acquisition (where it
-        // blocks in the fixed code) so the test can prove community's cancel
-        // cannot fire before the winning enqueue completes.
+        // try_send, while the transition lock is held.  Keyed by hook_key so
+        // concurrent tests never share a callback slot.
         // Zero-cost in production.  [FI-TRACE-CANCEL-RACE, W_expiry_cancel_race]
         #[cfg(test)]
-        expiry_race_test_hook::fire_after_reason_win();
+        expiry_race_test_hook::fire_after_reason_win(self.hook_key);
         if won {
             let _ = frame_tx.try_send(crate::nip_fi_session::authorization_denied_frame(route));
         }
@@ -261,13 +257,11 @@ impl CommunityConnectionControl {
             Some(_) => false,
         });
         // Test-only hook: fires after winning reason publication but before
-        // try_send, while the transition lock is held.  Allows a concurrent
-        // disconnect_community to race into its own lock acquisition (where it
-        // blocks in the fixed code) so the test can prove community's cancel
-        // cannot fire before the winning enqueue completes.
+        // try_send, while the transition lock is held.  Keyed by hook_key so
+        // concurrent tests never share a callback slot.
         // Zero-cost in production.  [FI-TRACE-CANCEL-RACE, W_auth_cancel_race]
         #[cfg(test)]
-        auth_race_test_hook::fire_after_reason_win();
+        auth_race_test_hook::fire_after_reason_win(self.hook_key);
         if won {
             let _ = frame_tx.try_send(crate::nip_fi_session::authorization_denied_frame(route));
         }
@@ -420,10 +414,11 @@ impl CommunityConnectionControl {
         });
         // Test-only hook: fires after winning reason publication but before
         // try_send, allowing a concurrent disconnect_community to run its
-        // critical section while this deny path is paused.  Zero-cost in
+        // critical section while this deny path is paused.  Keyed by hook_key
+        // so concurrent tests never share a callback slot.  Zero-cost in
         // production. [FI-TRACE-CANCEL-RACE, W_cancel_race]
         #[cfg(test)]
-        cancel_race_test_hook::fire_after_reason_win();
+        cancel_race_test_hook::fire_after_reason_win(self.hook_key);
         if won {
             if let Some(ref tx) = *slot {
                 let _ = tx.try_send(crate::nip_fi_session::authorization_denied_frame(
@@ -1965,56 +1960,50 @@ impl std::fmt::Debug for AppState {
     }
 }
 
-/// Shared type for test-only race-witness hook slots.  One alias silences the
-/// `clippy::type_complexity` warning that would fire on each `static HOOK`
-/// declaration in the three hook modules below.  Zero-cost: `#[cfg(test)]`
-/// only, never compiled into production.
+/// Shared type alias for UUID-keyed test-only race-witness hook maps.  All
+/// four hook modules below (cancel, expiry, pairing, auth) use the same
+/// `HashMap<Uuid, Arc<dyn Fn()>>` layout as `manager_race_test_hook` so that
+/// concurrent tests arm different per-control slots and never share a blocking
+/// callback.  Zero-cost: `#[cfg(test)]` only.  [F7: parallel-test hook isolation]
 #[cfg(test)]
-type HookSlot =
-    std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>>;
-/// Inner lock type for the hook slot (used as the return type of `hook_slot()`).
-#[cfg(test)]
-type HookCell = std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>;
+type HookMap =
+    std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::sync::Arc<dyn Fn() + Send + Sync>>>;
 
 /// Test-only synchronization hook for the cancel-ordering race witness.
 ///
-/// Production code: `#[cfg(test)] cancel_race_test_hook::fire_after_reason_win();`
+/// Production code: `#[cfg(test)] cancel_race_test_hook::fire_after_reason_win(self.hook_key);`
 /// in `disconnect_nip_fi`, inside the terminal_frame_tx lock, after winning
 /// `send_if_modified` but before `try_send`.
 ///
-/// Tests arm with `cancel_race_test_hook::arm(callback)` where `callback` is a
-/// `Fn()` that blocks until the test is ready to let the deny path continue.
-/// The callback runs while the terminal_frame_tx lock is HELD — so concurrent
-/// `disconnect_community` calls that take the same lock will block until the
-/// hook completes. This is what allows a deterministic concurrent witness.
-///
-/// Zero-cost in production: the module and its `fire_after_reason_win` symbol
-/// are only compiled under `#[cfg(test)]`. [FI-TRACE-CANCEL-RACE]
+/// Keyed by per-control `hook_key` so concurrent tests arm different slots and
+/// never deadlock on a shared callback.  [F7: parallel-test hook isolation]
+/// Zero-cost in production.  [FI-TRACE-CANCEL-RACE]
 #[cfg(test)]
 pub(crate) mod cancel_race_test_hook {
     use std::sync::Arc;
 
-    static HOOK: super::HookSlot = std::sync::OnceLock::new();
+    static HOOKS: std::sync::OnceLock<super::HookMap> = std::sync::OnceLock::new();
 
-    fn hook_slot() -> &'static super::HookCell {
-        HOOK.get_or_init(|| std::sync::Mutex::new(None))
+    fn hook_map() -> &'static super::HookMap {
+        HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
     }
 
-    /// Arm the hook with a callback that runs while the terminal_frame_tx lock
-    /// is held, after winning reason publication but before try_send.
-    pub(crate) fn arm(cb: Arc<dyn Fn() + Send + Sync>) {
-        *hook_slot().lock().unwrap() = Some(cb);
+    /// Arm the hook for `key` with a callback that runs while the
+    /// terminal_frame_tx lock is held, after winning reason publication but
+    /// before try_send.
+    pub(crate) fn arm(key: uuid::Uuid, cb: Arc<dyn Fn() + Send + Sync>) {
+        hook_map().lock().unwrap().insert(key, cb);
     }
 
-    /// Disarm the hook (call after the test to prevent interference).
-    pub(crate) fn disarm() {
-        *hook_slot().lock().unwrap() = None;
+    /// Disarm the hook for `key` (call after the test to prevent interference).
+    pub(crate) fn disarm(key: uuid::Uuid) {
+        hook_map().lock().unwrap().remove(&key);
     }
 
     /// Called by `disconnect_nip_fi` inside the critical section.
-    /// No-op when not armed.
-    pub(crate) fn fire_after_reason_win() {
-        let cb = hook_slot().lock().unwrap().clone();
+    /// No-op when not armed for this key.
+    pub(crate) fn fire_after_reason_win(key: uuid::Uuid) {
+        let cb = hook_map().lock().unwrap().get(&key).cloned();
         if let Some(f) = cb {
             f();
         }
@@ -2023,37 +2012,39 @@ pub(crate) mod cancel_race_test_hook {
 
 /// Test-only synchronization hook for the expiry/delete cancel-ordering race witness.
 ///
-/// Production code: `#[cfg(test)] expiry_race_test_hook::fire_after_reason_win();`
+/// Production code: `#[cfg(test)] expiry_race_test_hook::fire_after_reason_win(self.hook_key);`
 /// in `expiry_deny_terminal`, inside the terminal_frame_tx lock, after winning
 /// `send_if_modified` but before `try_send`.
 ///
-/// Same shape as `cancel_race_test_hook` but for the expiry-task path.
+/// Keyed by per-control `hook_key` so concurrent tests arm different slots and
+/// never deadlock on a shared callback.  [F7: parallel-test hook isolation]
 /// Zero-cost in production.  [FI-TRACE-CANCEL-RACE, W_expiry_cancel_race]
 #[cfg(test)]
 pub(crate) mod expiry_race_test_hook {
     use std::sync::Arc;
 
-    static HOOK: super::HookSlot = std::sync::OnceLock::new();
+    static HOOKS: std::sync::OnceLock<super::HookMap> = std::sync::OnceLock::new();
 
-    fn hook_slot() -> &'static super::HookCell {
-        HOOK.get_or_init(|| std::sync::Mutex::new(None))
+    fn hook_map() -> &'static super::HookMap {
+        HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
     }
 
-    /// Arm the hook with a callback that runs while the terminal_frame_tx lock
-    /// is held, after expiry wins reason publication but before its try_send.
-    pub(crate) fn arm(cb: Arc<dyn Fn() + Send + Sync>) {
-        *hook_slot().lock().unwrap() = Some(cb);
+    /// Arm the hook for `key` with a callback that runs while the
+    /// terminal_frame_tx lock is held, after expiry wins reason publication
+    /// but before its try_send.
+    pub(crate) fn arm(key: uuid::Uuid, cb: Arc<dyn Fn() + Send + Sync>) {
+        hook_map().lock().unwrap().insert(key, cb);
     }
 
-    /// Disarm the hook (call after the test to prevent interference).
-    pub(crate) fn disarm() {
-        *hook_slot().lock().unwrap() = None;
+    /// Disarm the hook for `key` (call after the test to prevent interference).
+    pub(crate) fn disarm(key: uuid::Uuid) {
+        hook_map().lock().unwrap().remove(&key);
     }
 
     /// Called by `expiry_deny_terminal` inside the critical section.
-    /// No-op when not armed.
-    pub(crate) fn fire_after_reason_win() {
-        let cb = hook_slot().lock().unwrap().clone();
+    /// No-op when not armed for this key.
+    pub(crate) fn fire_after_reason_win(key: uuid::Uuid) {
+        let cb = hook_map().lock().unwrap().get(&key).cloned();
         if let Some(f) = cb {
             f();
         }
@@ -2062,37 +2053,39 @@ pub(crate) mod expiry_race_test_hook {
 
 /// Test-only synchronization hook for the root-pairing/delete cancel-ordering race witness.
 ///
-/// Production code: `#[cfg(test)] pairing_race_test_hook::fire_after_reason_win();`
+/// Production code: `#[cfg(test)] pairing_race_test_hook::fire_after_reason_win(self.hook_key);`
 /// in `pairing_deny_terminal`, inside the terminal_frame_tx lock, after winning
 /// `send_if_modified` but before `try_send`.
 ///
-/// Same shape as `cancel_race_test_hook` but for the root key-pairing path.
+/// Keyed by per-control `hook_key` so concurrent tests arm different slots and
+/// never deadlock on a shared callback.  [F7: parallel-test hook isolation]
 /// Zero-cost in production.  [FI-TRACE-CANCEL-RACE, W_pairing_cancel_race]
 #[cfg(test)]
 pub(crate) mod pairing_race_test_hook {
     use std::sync::Arc;
 
-    static HOOK: super::HookSlot = std::sync::OnceLock::new();
+    static HOOKS: std::sync::OnceLock<super::HookMap> = std::sync::OnceLock::new();
 
-    fn hook_slot() -> &'static super::HookCell {
-        HOOK.get_or_init(|| std::sync::Mutex::new(None))
+    fn hook_map() -> &'static super::HookMap {
+        HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
     }
 
-    /// Arm the hook with a callback that runs while the terminal_frame_tx lock
-    /// is held, after root pairing wins reason publication but before its try_send.
-    pub(crate) fn arm(cb: Arc<dyn Fn() + Send + Sync>) {
-        *hook_slot().lock().unwrap() = Some(cb);
+    /// Arm the hook for `key` with a callback that runs while the
+    /// terminal_frame_tx lock is held, after root pairing wins reason
+    /// publication but before its try_send.
+    pub(crate) fn arm(key: uuid::Uuid, cb: Arc<dyn Fn() + Send + Sync>) {
+        hook_map().lock().unwrap().insert(key, cb);
     }
 
-    /// Disarm the hook (call after the test to prevent interference).
-    pub(crate) fn disarm() {
-        *hook_slot().lock().unwrap() = None;
+    /// Disarm the hook for `key` (call after the test to prevent interference).
+    pub(crate) fn disarm(key: uuid::Uuid) {
+        hook_map().lock().unwrap().remove(&key);
     }
 
     /// Called by `pairing_deny_terminal` inside the critical section.
-    /// No-op when not armed.
-    pub(crate) fn fire_after_reason_win() {
-        let cb = hook_slot().lock().unwrap().clone();
+    /// No-op when not armed for this key.
+    pub(crate) fn fire_after_reason_win(key: uuid::Uuid) {
+        let cb = hook_map().lock().unwrap().get(&key).cloned();
         if let Some(f) = cb {
             f();
         }
@@ -2101,35 +2094,37 @@ pub(crate) mod pairing_race_test_hook {
 
 /// Test-only injection point for the auth-handler deny-set path.
 ///
-/// Production code: `#[cfg(test)] auth_race_test_hook::fire_after_reason_win();`
+/// Production code: `#[cfg(test)] auth_race_test_hook::fire_after_reason_win(self.hook_key);`
 ///
-/// Same shape as `cancel_race_test_hook` but for the post-registration deny-set
-/// handler path.  Zero-cost in production.  [FI-TRACE-CANCEL-RACE, W_auth_cancel_race]
+/// Keyed by per-control `hook_key` so concurrent tests arm different slots and
+/// never deadlock on a shared callback.  [F7: parallel-test hook isolation]
+/// Zero-cost in production.  [FI-TRACE-CANCEL-RACE, W_auth_cancel_race]
 #[cfg(test)]
 pub(crate) mod auth_race_test_hook {
     use std::sync::Arc;
 
-    static HOOK: super::HookSlot = std::sync::OnceLock::new();
+    static HOOKS: std::sync::OnceLock<super::HookMap> = std::sync::OnceLock::new();
 
-    fn hook_slot() -> &'static super::HookCell {
-        HOOK.get_or_init(|| std::sync::Mutex::new(None))
+    fn hook_map() -> &'static super::HookMap {
+        HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
     }
 
-    /// Arm the hook with a callback that runs while the terminal_frame_tx lock
-    /// is held, after auth wins reason publication but before its try_send.
-    pub(crate) fn arm(cb: Arc<dyn Fn() + Send + Sync>) {
-        *hook_slot().lock().unwrap() = Some(cb);
+    /// Arm the hook for `key` with a callback that runs while the
+    /// terminal_frame_tx lock is held, after auth wins reason publication but
+    /// before its try_send.
+    pub(crate) fn arm(key: uuid::Uuid, cb: Arc<dyn Fn() + Send + Sync>) {
+        hook_map().lock().unwrap().insert(key, cb);
     }
 
-    /// Disarm the hook (call after the test to prevent interference).
-    pub(crate) fn disarm() {
-        *hook_slot().lock().unwrap() = None;
+    /// Disarm the hook for `key` (call after the test to prevent interference).
+    pub(crate) fn disarm(key: uuid::Uuid) {
+        hook_map().lock().unwrap().remove(&key);
     }
 
     /// Called by `auth_deny_terminal` inside the critical section.
-    /// No-op when not armed.
-    pub(crate) fn fire_after_reason_win() {
-        let cb = hook_slot().lock().unwrap().clone();
+    /// No-op when not armed for this key.
+    pub(crate) fn fire_after_reason_win(key: uuid::Uuid) {
+        let cb = hook_map().lock().unwrap().get(&key).cloned();
         if let Some(f) = cb {
             f();
         }
@@ -2241,7 +2236,9 @@ pub(crate) mod tests {
     /// tests deterministically exercise fail-closed database seams without
     /// depending on whether a developer has the normal test database running.
     pub(crate) async fn test_state_with_database_url(database_url: &str) -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // hermetic_for_test: env-free — never races NIP-FI env-var mutations
+        // from concurrent nip_fi_config tests in the same binary. [F6]
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.database_url = database_url.to_owned();
@@ -2257,7 +2254,9 @@ pub(crate) mod tests {
     /// lifecycle tests use this to hold the sole connection as a deterministic
     /// barrier while AUTH waits in the real database acquisition path.
     pub(crate) async fn test_state_with_database_pool(pool: sqlx::PgPool) -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // hermetic_for_test: env-free — never races NIP-FI env-var mutations
+        // from concurrent nip_fi_config tests in the same binary. [F6]
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.read_database_url = None;
@@ -3741,24 +3740,42 @@ pub(crate) mod tests {
     //   - Restore exact head → PASS.
     #[test]
     fn w_cancel_race_deny_payload_precedes_community_cancel() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::Arc;
 
         let (terminal_tx, terminal_rx) = tokio::sync::mpsc::channel(1);
         let cancel = CancellationToken::new();
         let control = CommunityConnectionControl::new(cancel.clone());
         control.set_terminal_frame_sender(terminal_tx);
 
-        let barrier = Arc::new(Barrier::new(2));
-        let barrier_for_hook = Arc::clone(&barrier);
+        // Bounded rendezvous: hook signals "reached critical section" on
+        // hook_ready_tx; main thread receives on hook_ready_rx (5 s timeout).
+        // Main thread signals "proceed" on hook_proceed_tx; hook receives on
+        // hook_proceed_rx (5 s timeout).  Replaces the Barrier::new(2) +
+        // sleep(30ms) pattern — bounded, fails fast with a diagnostic rather
+        // than hanging indefinitely.  [F7: bounded rendezvous]
+        let (hook_ready_tx, hook_ready_rx) = std::sync::mpsc::channel::<()>();
+        let (hook_proceed_tx, hook_proceed_rx_inner) = std::sync::mpsc::channel::<()>();
+        let hook_proceed_rx = std::sync::Arc::new(std::sync::Mutex::new(hook_proceed_rx_inner));
+        let hook_key = control.hook_key;
 
         // Arm: fires after reason win, while terminal_frame_tx lock is held.
-        cancel_race_test_hook::arm(Arc::new(move || {
-            // Rendezvous: signal deny has won reason and the lock is held.
-            barrier_for_hook.wait();
-            // Hold the lock long enough for the main thread to call
-            // disconnect_community and block on it (fix) or fire cancel (mutation).
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }));
+        cancel_race_test_hook::arm(
+            hook_key,
+            Arc::new(move || {
+                // Signal main thread: deny has won reason and the lock is held.
+                hook_ready_tx.send(()).unwrap();
+                // Wait for main thread's permission to proceed (lock is held
+                // here — disconnect_community blocks on it in the fixed code).
+                hook_proceed_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect(
+                        "W_cancel_race hook: main thread did not send proceed within 5 s — \
+                             disconnect_community probably never called or deadlocked",
+                    );
+            }),
+        );
 
         // Consumer thread: wakes on the FIRST cancel signal and immediately
         // drains the terminal channel.  With the fix, the first cancel fires
@@ -3786,11 +3803,19 @@ pub(crate) mod tests {
         });
 
         // Wait for deny to reach the hook (won reason, lock held).
-        barrier.wait();
+        hook_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "W_cancel_race: hook never fired within 5 s — \
+                     mutation: disconnect_nip_fi hook path never reached",
+            );
 
         // FIXED: blocks until deny drops the lock (after try_send + cancel).
         // MUTATION: runs cancel immediately, before try_send.
         control.disconnect_community();
+
+        // Allow the hook to proceed (hook is blocking on hook_proceed_rx).
+        hook_proceed_tx.send(()).unwrap();
 
         deny_thread
             .join()
@@ -3798,7 +3823,7 @@ pub(crate) mod tests {
         consumer_thread
             .join()
             .expect("W_cancel_race: consumer thread panicked");
-        cancel_race_test_hook::disarm();
+        cancel_race_test_hook::disarm(hook_key);
 
         // Consumer observed the channel at the moment of the first cancel.
         // With the fix: deny's try_send already happened → frame present.
@@ -3908,20 +3933,31 @@ pub(crate) mod tests {
     // cannot call cancel.cancel() until expiry's try_send completes.
     #[test]
     fn w_expiry_cancel_race_payload_precedes_community_cancel() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::Arc;
 
         let (terminal_tx, terminal_rx) = tokio::sync::mpsc::channel(1);
         let cancel = CancellationToken::new();
         let control = CommunityConnectionControl::new(cancel.clone());
 
-        let barrier = Arc::new(Barrier::new(2));
-        let barrier_for_hook = Arc::clone(&barrier);
+        let (hook_ready_tx, hook_ready_rx) = std::sync::mpsc::channel::<()>();
+        let (hook_proceed_tx, hook_proceed_rx_inner) = std::sync::mpsc::channel::<()>();
+        let hook_proceed_rx = std::sync::Arc::new(std::sync::Mutex::new(hook_proceed_rx_inner));
+        let hook_key = control.hook_key;
 
         // Arm: fires after expiry wins reason, while the lock is held.
-        expiry_race_test_hook::arm(Arc::new(move || {
-            barrier_for_hook.wait();
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }));
+        expiry_race_test_hook::arm(
+            hook_key,
+            Arc::new(move || {
+                hook_ready_tx.send(()).unwrap();
+                hook_proceed_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect(
+                        "W_expiry_cancel_race hook: main thread did not send proceed within 5 s",
+                    );
+            }),
+        );
 
         // Consumer: wakes on first cancel, drains terminal channel immediately.
         let cancel_for_consumer = cancel.clone();
@@ -3952,11 +3988,19 @@ pub(crate) mod tests {
         });
 
         // Wait for expiry to reach the hook (won reason, lock held).
-        barrier.wait();
+        hook_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "W_expiry_cancel_race: hook never fired within 5 s — \
+                     mutation: expiry_deny_terminal hook path never reached",
+            );
 
         // FIXED: blocks until expiry drops the lock (after try_send).
         // MUTATION (remove lock from disconnect_community): cancels before try_send.
         control.disconnect_community();
+
+        // Allow the hook to proceed.
+        hook_proceed_tx.send(()).unwrap();
 
         expiry_thread
             .join()
@@ -3964,7 +4008,7 @@ pub(crate) mod tests {
         consumer_thread
             .join()
             .expect("W_expiry_cancel_race: consumer thread panicked");
-        expiry_race_test_hook::disarm();
+        expiry_race_test_hook::disarm(hook_key);
 
         let consumer_saw = consumer_result
             .lock()
@@ -4078,20 +4122,31 @@ pub(crate) mod tests {
     //   - Restore exact head → PASS.
     #[test]
     fn w_pairing_cancel_race_payload_precedes_community_cancel() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::Arc;
 
         let (terminal_tx, terminal_rx) = tokio::sync::mpsc::channel(1);
         let cancel = CancellationToken::new();
         let control = CommunityConnectionControl::new(cancel.clone());
 
-        let barrier = Arc::new(Barrier::new(2));
-        let barrier_for_hook = Arc::clone(&barrier);
+        let (hook_ready_tx, hook_ready_rx) = std::sync::mpsc::channel::<()>();
+        let (hook_proceed_tx, hook_proceed_rx_inner) = std::sync::mpsc::channel::<()>();
+        let hook_proceed_rx = std::sync::Arc::new(std::sync::Mutex::new(hook_proceed_rx_inner));
+        let hook_key = control.hook_key;
 
         // Arm: fires after pairing wins reason, while the lock is held.
-        pairing_race_test_hook::arm(Arc::new(move || {
-            barrier_for_hook.wait();
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }));
+        pairing_race_test_hook::arm(
+            hook_key,
+            Arc::new(move || {
+                hook_ready_tx.send(()).unwrap();
+                hook_proceed_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect(
+                        "W_pairing_cancel_race hook: main thread did not send proceed within 5 s",
+                    );
+            }),
+        );
 
         // Consumer: wakes on first cancel, drains terminal channel immediately.
         let cancel_for_consumer = cancel.clone();
@@ -4122,11 +4177,19 @@ pub(crate) mod tests {
         });
 
         // Wait for pairing to reach the hook (won reason, lock held).
-        barrier.wait();
+        hook_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "W_pairing_cancel_race: hook never fired within 5 s — \
+                     mutation: pairing_deny_terminal hook path never reached",
+            );
 
         // FIXED: blocks until pairing drops the lock (after try_send).
         // MUTATION (remove lock from disconnect_community): cancels before try_send.
         control.disconnect_community();
+
+        // Allow the hook to proceed.
+        hook_proceed_tx.send(()).unwrap();
 
         pairing_thread
             .join()
@@ -4134,7 +4197,7 @@ pub(crate) mod tests {
         consumer_thread
             .join()
             .expect("W_pairing_cancel_race: consumer thread panicked");
-        pairing_race_test_hook::disarm();
+        pairing_race_test_hook::disarm(hook_key);
 
         let consumer_saw = consumer_result
             .lock()
@@ -4227,19 +4290,28 @@ pub(crate) mod tests {
     // channel → RED. Restore → PASS.
     #[test]
     fn w_auth_cancel_race_payload_precedes_community_cancel() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::Arc;
 
         let (terminal_tx, terminal_rx) = tokio::sync::mpsc::channel(1);
         let cancel = CancellationToken::new();
         let control = CommunityConnectionControl::new(cancel.clone());
 
-        let barrier = Arc::new(Barrier::new(2));
-        let barrier_for_hook = Arc::clone(&barrier);
+        let (hook_ready_tx, hook_ready_rx) = std::sync::mpsc::channel::<()>();
+        let (hook_proceed_tx, hook_proceed_rx_inner) = std::sync::mpsc::channel::<()>();
+        let hook_proceed_rx = std::sync::Arc::new(std::sync::Mutex::new(hook_proceed_rx_inner));
+        let hook_key = control.hook_key;
 
-        auth_race_test_hook::arm(Arc::new(move || {
-            barrier_for_hook.wait();
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }));
+        auth_race_test_hook::arm(
+            hook_key,
+            Arc::new(move || {
+                hook_ready_tx.send(()).unwrap();
+                hook_proceed_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("W_auth_cancel_race hook: main thread did not send proceed within 5 s");
+            }),
+        );
 
         let cancel_for_consumer = cancel.clone();
         let consumer_result: Arc<std::sync::Mutex<Option<Result<WsMessage, _>>>> =
@@ -4265,10 +4337,18 @@ pub(crate) mod tests {
             cancel_for_auth.cancel();
         });
 
-        barrier.wait();
+        hook_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "W_auth_cancel_race: hook never fired within 5 s — \
+                     mutation: auth_deny_terminal hook path never reached",
+            );
 
         // FIXED: blocks until auth drops the lock (after try_send).
         control.disconnect_community();
+
+        // Allow the hook to proceed.
+        hook_proceed_tx.send(()).unwrap();
 
         auth_thread
             .join()
@@ -4277,7 +4357,7 @@ pub(crate) mod tests {
             .join()
             .expect("W_auth_cancel_race: consumer thread panicked");
 
-        auth_race_test_hook::disarm();
+        auth_race_test_hook::disarm(hook_key);
 
         let consumer_saw = consumer_result
             .lock()
@@ -4385,7 +4465,7 @@ pub(crate) mod tests {
     // channel → RED. Restore → PASS.
     #[test]
     fn w_manager_cancel_race_payload_precedes_community_cancel() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::Arc;
 
         let (terminal_tx, terminal_rx) = tokio::sync::mpsc::channel(1);
         let cancel = CancellationToken::new();
@@ -4394,14 +4474,21 @@ pub(crate) mod tests {
         // this control instance.  Parallel tests arm different keys. [F7]
         let hook_key = control.hook_key;
 
-        let barrier = Arc::new(Barrier::new(2));
-        let barrier_for_hook = Arc::clone(&barrier);
+        let (hook_ready_tx, hook_ready_rx) = std::sync::mpsc::channel::<()>();
+        let (hook_proceed_tx, hook_proceed_rx_inner) = std::sync::mpsc::channel::<()>();
+        let hook_proceed_rx = std::sync::Arc::new(std::sync::Mutex::new(hook_proceed_rx_inner));
 
         manager_race_test_hook::arm(
             hook_key,
             Arc::new(move || {
-                barrier_for_hook.wait();
-                std::thread::sleep(std::time::Duration::from_millis(30));
+                hook_ready_tx.send(()).unwrap();
+                hook_proceed_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect(
+                        "W_manager_cancel_race hook: main thread did not send proceed within 5 s",
+                    );
             }),
         );
 
@@ -4425,10 +4512,18 @@ pub(crate) mod tests {
             // manager_disconnect_nip_fi cancels internally; no separate cancel() needed.
         });
 
-        barrier.wait();
+        hook_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "W_manager_cancel_race: hook never fired within 5 s — \
+                     mutation: manager_disconnect_nip_fi hook path never reached",
+            );
 
         // FIXED: blocks until manager drops the lock (after try_send).
         control.disconnect_community();
+
+        // Allow the hook to proceed.
+        hook_proceed_tx.send(()).unwrap();
 
         manager_thread
             .join()
@@ -4560,7 +4655,7 @@ pub(crate) mod tests {
     // Restore → PASS.
     #[test]
     fn w_lifecycle_cancel_race_payload_precedes_lifecycle_cancel() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::Arc;
 
         let (terminal_tx, terminal_rx) = tokio::sync::mpsc::channel(1);
         let cancel = CancellationToken::new();
@@ -4568,18 +4663,24 @@ pub(crate) mod tests {
         // Capture per-control key for scoped hook. [F7]
         let hook_key = control.hook_key;
 
-        let barrier = Arc::new(Barrier::new(2));
-        let barrier_for_hook = Arc::clone(&barrier);
+        let (hook_ready_tx, hook_ready_rx) = std::sync::mpsc::channel::<()>();
+        let (hook_proceed_tx, hook_proceed_rx_inner) = std::sync::mpsc::channel::<()>();
+        let hook_proceed_rx = std::sync::Arc::new(std::sync::Mutex::new(hook_proceed_rx_inner));
 
         manager_race_test_hook::arm(
             hook_key,
             Arc::new(move || {
-                // Rendez-vous with main thread so lifecycle_cancel races immediately.
-                barrier_for_hook.wait();
-                // Hold the lock for a brief window — main's lifecycle_cancel must
-                // block here (under the fix) or fire cancel prematurely (under
-                // mutation).
-                std::thread::sleep(std::time::Duration::from_millis(30));
+                // Signal main thread: manager has won reason, lock is held.
+                hook_ready_tx.send(()).unwrap();
+                // Hold the lock — main's lifecycle_cancel must block here (fix)
+                // or fire cancel prematurely (mutation).
+                hook_proceed_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect(
+                        "W_lifecycle_cancel_race hook: main thread did not send proceed within 5 s",
+                    );
             }),
         );
 
@@ -4605,14 +4706,22 @@ pub(crate) mod tests {
             control_for_manager.manager_disconnect_nip_fi(&terminal_tx_for_manager);
         });
 
-        // Rendez-vous: manager has won reason and is paused inside the hook.
-        barrier.wait();
+        // Wait for manager to reach the hook (won reason, lock held).
+        hook_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "W_lifecycle_cancel_race: hook never fired within 5 s — \
+                     mutation: manager_disconnect_nip_fi hook path never reached",
+            );
 
         // FIXED: lifecycle_cancel acquires the lock — blocks until manager drops
         // it after try_send, so the consumer never sees an empty channel.
         // MUTATION: lifecycle_cancel calls cancel.cancel() without the lock —
         // consumer wakes before manager's try_send, sees Err(Empty).
         control.lifecycle_cancel();
+
+        // Allow the hook to proceed (manager's try_send can now complete).
+        hook_proceed_tx.send(()).unwrap();
 
         manager_thread
             .join()
@@ -4674,7 +4783,7 @@ pub(crate) mod tests {
     //   Restore → PASS.
     #[test]
     fn w_root_manager_drain_race_payload_precedes_drain_lifecycle_cancel() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::Arc;
 
         let mgr = Arc::new(ConnectionManager::new());
         let conn_id = Uuid::new_v4();
@@ -4706,16 +4815,19 @@ pub(crate) mod tests {
         );
         mgr.set_authenticated_pubkey(conn_id, pubkey.clone());
 
-        let barrier = Arc::new(Barrier::new(2));
-        let barrier_for_hook = Arc::clone(&barrier);
+        let (hook_ready_tx, hook_ready_rx) = std::sync::mpsc::channel::<()>();
+        let (hook_proceed_tx, hook_proceed_rx_inner) = std::sync::mpsc::channel::<()>();
+        let hook_proceed_rx = std::sync::Arc::new(std::sync::Mutex::new(hook_proceed_rx_inner));
 
         // Arm: fires after reason-win, while terminal_frame_tx lock is held by
         // manager_disconnect_nip_fi.
         manager_race_test_hook::arm(
             hook_key,
             Arc::new(move || {
-                barrier_for_hook.wait();
-                std::thread::sleep(std::time::Duration::from_millis(30));
+                hook_ready_tx.send(()).unwrap();
+                hook_proceed_rx.lock().unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("W_root_manager_drain_race hook: main thread did not send proceed within 5 s");
             }),
         );
 
@@ -4739,14 +4851,22 @@ pub(crate) mod tests {
             mgr_for_deny.disconnect_nip_fi(&pubkey_for_deny);
         });
 
-        // Rendezvous: deny has won reason and holds the lock.
-        barrier.wait();
+        // Wait for deny to reach the hook (won reason, lock held).
+        hook_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "W_root_manager_drain_race: hook never fired within 5 s — \
+                     mutation: manager_disconnect_nip_fi hook path never reached",
+            );
 
         // FIXED: lifecycle_cancel acquires the lock → blocks until deny's try_send
         // completes → consumer always sees the frame.
         // MUTATION: lifecycle_cancel calls cancel.cancel() bare → fires before
         // deny's try_send → consumer wakes on empty terminal channel → RED.
         mgr.drain_all();
+
+        // Allow the hook to proceed.
+        hook_proceed_tx.send(()).unwrap();
 
         deny_thread
             .join()
@@ -4810,7 +4930,7 @@ pub(crate) mod tests {
     //   Restore → PASS.
     #[test]
     fn w_audio_registry_lifecycle_cancel_race_payload_precedes_audio_teardown_cancel() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::Arc;
 
         let registry = Arc::new(CommunityConnectionRegistry::new());
         let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::from_u128(0xae));
@@ -4827,15 +4947,22 @@ pub(crate) mod tests {
         // Keep guard alive for the duration of the test — drop deregisters.
         let _guard = registry.register(Uuid::new_v4(), community, control.clone());
 
-        let barrier = Arc::new(Barrier::new(2));
-        let barrier_for_hook = Arc::clone(&barrier);
+        let hook_key = control.hook_key;
+        let (hook_ready_tx, hook_ready_rx) = std::sync::mpsc::channel::<()>();
+        let (hook_proceed_tx, hook_proceed_rx_inner) = std::sync::mpsc::channel::<()>();
+        let hook_proceed_rx = std::sync::Arc::new(std::sync::Mutex::new(hook_proceed_rx_inner));
 
         // Arm cancel_race_test_hook: fires inside disconnect_nip_fi after reason-win,
         // while terminal_frame_tx lock is held.
-        cancel_race_test_hook::arm(Arc::new(move || {
-            barrier_for_hook.wait();
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }));
+        cancel_race_test_hook::arm(
+            hook_key,
+            Arc::new(move || {
+                hook_ready_tx.send(()).unwrap();
+                hook_proceed_rx.lock().unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("W_audio_registry_lifecycle_cancel_race hook: main thread did not send proceed within 5 s");
+            }),
+        );
 
         // Consumer: wakes on first cancel, immediately drains terminal channel.
         let cancel_for_consumer = cancel.clone();
@@ -4860,14 +4987,22 @@ pub(crate) mod tests {
             }
         });
 
-        // Rendezvous: deny has won reason and is paused inside the hook.
-        barrier.wait();
+        // Wait for deny to reach the hook (won reason, lock held).
+        hook_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "W_audio_registry_lifecycle_cancel_race: hook never fired within 5 s — \
+                     mutation: disconnect_nip_fi hook path never reached",
+            );
 
         // FIXED: lifecycle_cancel acquires the lock → blocks until deny's try_send
         // completes → consumer always sees the frame.
         // MUTATION: lifecycle_cancel calls cancel.cancel() bare → audio teardown
         // fires cancel before deny's try_send → consumer sees Err(Empty) → RED.
         control.lifecycle_cancel();
+
+        // Allow the hook to proceed.
+        hook_proceed_tx.send(()).unwrap();
 
         deny_thread
             .join()
@@ -4876,7 +5011,7 @@ pub(crate) mod tests {
             .join()
             .expect("W_audio_registry_lifecycle_cancel_race: consumer thread panicked");
 
-        cancel_race_test_hook::disarm();
+        cancel_race_test_hook::disarm(hook_key);
 
         let consumer_saw = consumer_result
             .lock()

@@ -232,11 +232,15 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     // Route the reason frame on the control channel (not `send`,
                     // which uses the data channel and would race the cancel), so
                     // the send loop drains it ahead of the Close it emits on
-                    // cancel. Then cancel to close the socket immediately.
+                    // cancel. Then use lifecycle_cancel (holds the transition lock)
+                    // rather than raw cancel.cancel(), ensuring that a concurrent
+                    // expiry writer that has won the reason but hasn't yet enqueued
+                    // its denial frame completes its try_send before the cancel
+                    // wakes the consumer.  [FI-TRACE-CANCEL-RACE, B2 fix]
                     let _ = conn.ctrl_tx.try_send(WsMessage::Text(
                         RelayMessage::ok(&event_id_hex, false, deny_reason).into(),
                     ));
-                    conn.cancel.cancel();
+                    conn.community_control.lifecycle_cancel();
                     return;
                 }
             }

@@ -1549,7 +1549,9 @@ mod postgres_tests {
     }
 
     async fn disabled_mode_state() -> Arc<crate::state::AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // hermetic_for_test: env-free — never races NIP-FI env-var mutations
+        // from concurrent nip_fi_config tests in the same binary. [F6]
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.admin = Some(crate::config::AdminConfig {

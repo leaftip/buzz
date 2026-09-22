@@ -853,11 +853,24 @@ pub(crate) async fn handle_active_audio_connection(
                     ))
                     .await;
                 // I3 residual: await expiry task before resource teardown.
-                cancel.cancel();
+                // B2: lifecycle_cancel holds the transition lock so any concurrent
+                // terminal writer that won the reason but hasn't enqueued yet
+                // completes its try_send before the cancel wakes any consumer.
+                // [FI-TRACE-CANCEL-RACE, B2 fix]
+                control.lifecycle_cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
                     let _ = t.await;
                 }
                 guard.release_before_commit().await;
+                // Drain any denial frame queued by the expiry task.
+                use futures_util::SinkExt as _;
+                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                    let _ = ws_send.send(msg).await;
+                }
+                let nip_fi_close_reason = *disconnect_reason.borrow();
+                if let Some(reason) = nip_fi_close_reason {
+                    let _ = ws_send.send(reason.close_message()).await;
+                }
                 state
                     .audio_rooms
                     .cleanup_if_empty(tenant.community(), channel_id);
@@ -876,11 +889,24 @@ pub(crate) async fn handle_active_audio_connection(
                     ))
                     .await;
                 // I3 residual: await expiry task before resource teardown.
-                cancel.cancel();
+                // B2: lifecycle_cancel holds the transition lock so any concurrent
+                // terminal writer that won the reason but hasn't enqueued yet
+                // completes its try_send before the cancel wakes any consumer.
+                // [FI-TRACE-CANCEL-RACE, B2 fix]
+                control.lifecycle_cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
                     let _ = t.await;
                 }
                 guard.release_before_commit().await;
+                // Drain any denial frame queued by the expiry task.
+                use futures_util::SinkExt as _;
+                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                    let _ = ws_send.send(msg).await;
+                }
+                let nip_fi_close_reason = *disconnect_reason.borrow();
+                if let Some(reason) = nip_fi_close_reason {
+                    let _ = ws_send.send(reason.close_message()).await;
+                }
                 state
                     .audio_rooms
                     .cleanup_if_empty(tenant.community(), channel_id);
@@ -891,7 +917,10 @@ pub(crate) async fn handle_active_audio_connection(
         // IMPORTANT 3 residual: await expiry task explicitly, do not infer
         // completion from cancel.is_cancelled().
         if cancel.is_cancelled() {
-            cancel.cancel();
+            // B2: lifecycle_cancel holds the transition lock so a concurrent
+            // terminal writer completes its try_send before we enter the drain.
+            // [FI-TRACE-CANCEL-RACE, B2 fix]
+            control.lifecycle_cancel();
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
@@ -932,7 +961,11 @@ pub(crate) async fn handle_active_audio_connection(
                     crate::nip_fi_session::NipFiWsRoute::Audio,
                 );
                 // IMPORTANT 3 residual: await expiry task explicitly.
-                cancel.cancel();
+                // B2: lifecycle_cancel holds the transition lock so any concurrent
+                // terminal writer that won the reason but hasn't enqueued yet
+                // completes its try_send before the cancel wakes any consumer.
+                // [FI-TRACE-CANCEL-RACE, B2 fix]
+                control.lifecycle_cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
                     let _ = t.await;
                 }
@@ -974,7 +1007,8 @@ pub(crate) async fn handle_active_audio_connection(
                 warn!(channel_id = %channel_id, "audio room participant capacity reached");
                 let _ = ws_send.send(WsMessage::Text(serde_json::json!({"type":"error","code":"room_full","message":"room participant capacity reached"}).to_string().into())).await;
                 // IMPORTANT 3: cancel + await expiry task before guard release.
-                cancel.cancel();
+                // B2: lifecycle_cancel holds transition lock. [FI-TRACE-CANCEL-RACE, B2 fix]
+                control.lifecycle_cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
                     let _ = t.await;
                 }
@@ -985,7 +1019,8 @@ pub(crate) async fn handle_active_audio_connection(
                 debug!(channel_id = %channel_id, "room ended before admission");
                 let _ = ws_send.send(WsMessage::Text(serde_json::json!({"type":"error","code":"room_ended","message":"huddle has ended"}).to_string().into())).await;
                 // IMPORTANT 3: cancel + await expiry task before guard release.
-                cancel.cancel();
+                // B2: lifecycle_cancel holds transition lock. [FI-TRACE-CANCEL-RACE, B2 fix]
+                control.lifecycle_cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
                     let _ = t.await;
                 }
@@ -1000,7 +1035,8 @@ pub(crate) async fn handle_active_audio_connection(
                 "pinned_version": pinned, "requested_version": requested,
             }).to_string().into())).await;
                 // IMPORTANT 3: cancel + await expiry task before guard release.
-                cancel.cancel();
+                // B2: lifecycle_cancel holds transition lock. [FI-TRACE-CANCEL-RACE, B2 fix]
+                control.lifecycle_cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
                     let _ = t.await;
                 }
@@ -1027,7 +1063,8 @@ pub(crate) async fn handle_active_audio_connection(
         // its write-lock quiescence barrier (nip_fi_gate.rs). Cancel + await
         // the expiry task before releasing any resource so teardown cannot race
         // outstanding pre-expiry permits.
-        cancel.cancel();
+        // B2: lifecycle_cancel holds transition lock. [FI-TRACE-CANCEL-RACE, B2 fix]
+        control.lifecycle_cancel();
         if let Some(t) = _nip_fi_admission_expiry.take() {
             let _ = t.await;
         }
@@ -1249,7 +1286,8 @@ pub(crate) async fn handle_active_audio_connection(
             // via the deadline fast path (Utc::now() >= deadline) before the
             // spawned expiry task completes. Cancel + await the task explicitly —
             // do not infer task completion from SessionExpired.
-            cancel.cancel();
+            // B2: lifecycle_cancel holds transition lock. [FI-TRACE-CANCEL-RACE, B2 fix]
+            control.lifecycle_cancel();
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
@@ -1274,7 +1312,8 @@ pub(crate) async fn handle_active_audio_connection(
             // No `joined` frame was sent — commit-won invariant holds.
             debug!(channel_id = %channel_id, "channel archived before join commit");
             // IMPORTANT 3: cancel + await expiry task before peer/room teardown.
-            cancel.cancel();
+            // B2: lifecycle_cancel holds transition lock. [FI-TRACE-CANCEL-RACE, B2 fix]
+            control.lifecycle_cancel();
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
@@ -1294,7 +1333,8 @@ pub(crate) async fn handle_active_audio_connection(
             // No `joined` frame was sent — commit-won invariant holds.
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "parent membership lost before join commit");
             // IMPORTANT 3: cancel + await expiry task before peer/room teardown.
-            cancel.cancel();
+            // B2: lifecycle_cancel holds transition lock. [FI-TRACE-CANCEL-RACE, B2 fix]
+            control.lifecycle_cancel();
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
@@ -1315,7 +1355,8 @@ pub(crate) async fn handle_active_audio_connection(
             // No `joined` frame was sent — commit-won invariant holds.
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "huddle_started link gone before join commit");
             // IMPORTANT 3: cancel + await expiry task before peer/room teardown.
-            cancel.cancel();
+            // B2: lifecycle_cancel holds transition lock. [FI-TRACE-CANCEL-RACE, B2 fix]
+            control.lifecycle_cancel();
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
@@ -1335,7 +1376,8 @@ pub(crate) async fn handle_active_audio_connection(
             // No `joined` frame was sent — commit-won invariant holds.
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "48101 commit failed: {e}");
             // IMPORTANT 3: cancel + await expiry task before peer/room teardown.
-            cancel.cancel();
+            // B2: lifecycle_cancel holds transition lock. [FI-TRACE-CANCEL-RACE, B2 fix]
+            control.lifecycle_cancel();
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }

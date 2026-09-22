@@ -338,7 +338,11 @@ impl AuthLifecycleGuard {
 impl Drop for AuthLifecycleGuard {
     fn drop(&mut self) {
         if !self.finished {
-            self.conn.cancel.cancel();
+            // Use lifecycle_cancel (holds the transition lock) so a concurrent
+            // terminal writer that has won the reason but not yet enqueued its
+            // denial frame completes try_send before the cancel wakes the
+            // consumer.  [FI-TRACE-CANCEL-RACE, B2 fix]
+            self.conn.community_control.lifecycle_cancel();
             self.conn.finish_auth_on_close(AuthOutcome::Disconnect);
         }
     }
@@ -740,8 +744,15 @@ where
 
 /// Best-effort terminal delivery with one shared deadline. A socket that never
 /// becomes writable cannot retain its connection task or semaphore permit.
+///
+/// Drain order: terminal_ctrl_rx (NIP-FI denial frame) → first_ctrl (the
+/// in-flight ordinary control frame, if any) → ctrl_rx (remaining ordinary
+/// control frames) → Close.  The terminal channel must be drained first so a
+/// queued denial frame is delivered even when the ordinary control channel
+/// (capacity 8) is saturated with Pings/Pongs.  [FI-INV-05, B1 fix]
 async fn flush_terminal_frames<S>(
     sink: &mut S,
+    terminal_ctrl_rx: &mut mpsc::Receiver<WsMessage>,
     ctrl_rx: &mut mpsc::Receiver<WsMessage>,
     disconnect_reason: &watch::Receiver<Option<CommunityDisconnectReason>>,
     first_ctrl: Option<WsMessage>,
@@ -749,6 +760,16 @@ async fn flush_terminal_frames<S>(
     S: Sink<WsMessage> + Unpin,
 {
     let deadline = tokio::time::Instant::now() + WS_TERMINAL_FLUSH_TIMEOUT;
+    // Terminal channel first — ensures denial frame precedes ordinary control
+    // and Close even when ctrl_rx is saturated.
+    while let Ok(terminal_msg) = terminal_ctrl_rx.try_recv() {
+        if !matches!(
+            tokio::time::timeout_at(deadline, sink.send(terminal_msg)).await,
+            Ok(Ok(()))
+        ) {
+            return;
+        }
+    }
     if let Some(ctrl_msg) = first_ctrl {
         if !matches!(
             tokio::time::timeout_at(deadline, sink.send(ctrl_msg)).await,
@@ -788,8 +809,11 @@ async fn send_loop_inner<S>(
             match send_or_cancel(&mut ws_send, ctrl_msg.clone(), &cancel).await {
                 WriterStep::Completed => {}
                 WriterStep::Cancelled => {
+                    // Cancelled mid-top-of-loop drain: drain terminal first, then
+                    // the already-taken ctrl_msg, then remaining ctrl_rx, then Close.
                     flush_terminal_frames(
                         &mut ws_send,
+                        &mut terminal_ctrl_rx,
                         &mut ctrl_rx,
                         &disconnect_reason,
                         Some(ctrl_msg),
@@ -822,24 +846,18 @@ async fn send_loop_inner<S>(
             }
             _ = cancel.cancelled() => {
                 // Drain the terminal NIP-FI denial frame first (if any), then
-                // ordinary control frames, before writing Close. The terminal
-                // channel has capacity 1 and is written before cancel() fires,
-                // so it is always available when denial is enqueued — even when
-                // ctrl_rx (capacity 8) is full. This preserves the required
-                // "restricted: authorization denied" frame to the client in all
-                // queue-full scenarios.
-                while let Ok(terminal_msg) = terminal_ctrl_rx.try_recv() {
-                    if ws_send.send(terminal_msg).await.is_err() {
-                        return;
-                    }
-                }
-                // Drain any queued control frames before closing. A ban
-                // disconnect queues its `OK false "blocked: …"` reason frame on
-                // ctrl and then cancels; without this drain the biased branch
-                // would send Close first and the client would never learn why
-                // (the top-of-loop drain does not run again after we break).
-                // This makes "queue frame on ctrl, then cancel" a safe idiom.
-                flush_terminal_frames(&mut ws_send, &mut ctrl_rx, &disconnect_reason, None).await;
+                // ordinary control frames, before writing Close.  The shared
+                // flush_terminal_frames helper applies a single bounded deadline
+                // to all three queues so a stalled socket cannot retain the
+                // writer task indefinitely.  [FI-INV-05, B1 fix]
+                flush_terminal_frames(
+                    &mut ws_send,
+                    &mut terminal_ctrl_rx,
+                    &mut ctrl_rx,
+                    &disconnect_reason,
+                    None,
+                )
+                .await;
                 break;
             }
             Some(ctrl_msg) = ctrl_rx.recv() => {
@@ -848,6 +866,7 @@ async fn send_loop_inner<S>(
                     WriterStep::Cancelled => {
                         flush_terminal_frames(
                             &mut ws_send,
+                            &mut terminal_ctrl_rx,
                             &mut ctrl_rx,
                             &disconnect_reason,
                             Some(ctrl_msg),
@@ -865,6 +884,7 @@ async fn send_loop_inner<S>(
                     WriterStep::Cancelled => {
                         flush_terminal_frames(
                             &mut ws_send,
+                            &mut terminal_ctrl_rx,
                             &mut ctrl_rx,
                             &disconnect_reason,
                             None,
@@ -883,6 +903,7 @@ async fn send_loop_inner<S>(
                                 WriterStep::Cancelled => {
                                     flush_terminal_frames(
                                         &mut ws_send,
+                                        &mut terminal_ctrl_rx,
                                         &mut ctrl_rx,
                                         &disconnect_reason,
                                         None,
@@ -904,6 +925,7 @@ async fn send_loop_inner<S>(
                     WriterStep::Cancelled => {
                         flush_terminal_frames(
                             &mut ws_send,
+                            &mut terminal_ctrl_rx,
                             &mut ctrl_rx,
                             &disconnect_reason,
                             None,
