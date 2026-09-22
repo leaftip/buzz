@@ -3440,4 +3440,154 @@ mod tests {
         // Cleanup
         registry.release(session_id_1, 10);
     }
+
+    // ── Fix-B witness: CommitConfirmed arm in serve_control_loop ─────────────
+    //
+    // RegisterPeer places the ingress peer in `pending_registered`. When the
+    // ingress sends `CommitConfirmed`, `serve_control_loop` must:
+    //   1. Call `room.commit_peer(peer_id)` — marks committed, bumps revision,
+    //      fires the roster delta.
+    //   2. Call `room.broadcast_control(joined)` — fans out the `joined` JSON
+    //      to all local committed peers.
+    //
+    // This test drives the full `accept_inbound` path: RegisterPeer → pending →
+    // CommitConfirmed → commit_peer → broadcast. An owner-local Alice observer
+    // receives the `joined` broadcast and the delta channel sees exactly one
+    // event with a revision strictly greater than the pre-admission snapshot.
+    //
+    // ## Mutation oracle
+    //
+    // A) Comment out `room.commit_peer(peer_id)` in the `CommitConfirmed` arm
+    //    of `serve_control_loop` (join.rs) → delta never fires → `delta_rx.recv()`
+    //    on a timeout returns None → assertion panics.
+    // B) Comment out `room.broadcast_control(joined)` in the same arm →
+    //    Alice's `ctrl_rx.recv()` returns None (timeout) → assertion panics.
+    //
+    // No Postgres required; uses the in-memory `stream_pair()` transport.
+    #[tokio::test]
+    async fn fix_b_commit_confirmed_arm_commits_peer_and_broadcasts_joined() {
+        let owner_rt = rt(1);
+        let from = rt(2);
+        let session_id = Uuid::new_v4();
+        let fenced = fenced_owned_by(owner_rt, session_id);
+        let rooms = Arc::new(AudioRoomManager::new());
+
+        // Alice: owner-local committed peer; subscribes to both the roster delta
+        // channel and her own ctrl channel to receive the broadcast.
+        let room = rooms.get_or_create(community(), session_id);
+        let (alice_id, _, _, _, mut alice_ctrl_rx, _) = room.add_peer("alice".into(), 2).unwrap();
+        room.mark_committed(alice_id);
+        // Subscribe to roster deltas AFTER alice's join to start clean.
+        let mut delta_rx = room.subscribe_roster();
+        let _ = delta_rx.try_recv(); // drain alice's own join delta
+
+        let pre_bob_revision = room.roster_snapshot().revision;
+
+        let acceptor = HuddleControlAcceptor::new(
+            Arc::clone(&rooms),
+            Arc::new(NullTransport) as Arc<dyn RelayPeerTransport>,
+            Arc::new(FakeDir::default()),
+            owner_rt,
+            Arc::new(HuddleOwnerRegistry::new()),
+        );
+
+        let (owner_stream, mut client) = stream_pair();
+        let hello = huddle_hello(from, fenced);
+        let served =
+            tokio::spawn(async move { acceptor.accept_inbound(from, hello, owner_stream).await });
+
+        // RegisterPeer: puts bob in pending_registered, returns PeerRegistered.
+        client
+            .send_frame(MeshStreamFrame::Data {
+                fenced,
+                payload: encode_control(&HuddleControlMsg::RegisterPeer {
+                    community_id: *community().as_uuid(),
+                    pubkey: "bob".into(),
+                    protocol_version: 2,
+                })
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+        let registered = client.recv_frame().await.unwrap().unwrap();
+        assert!(
+            matches!(registered, MeshStreamFrame::Data { .. }),
+            "expected PeerRegistered reply"
+        );
+
+        // No delta before CommitConfirmed — pending slot must not publish.
+        assert!(
+            delta_rx.try_recv().is_err(),
+            "Fix-B CommitConfirmed: pending RegisterPeer must not fire a roster delta"
+        );
+
+        // CommitConfirmed: triggers commit_peer + broadcast_control in the arm.
+        client
+            .send_frame(MeshStreamFrame::Data {
+                fenced,
+                payload: encode_control(&HuddleControlMsg::CommitConfirmed {
+                    pubkey: "bob".into(),
+                })
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+
+        // Alice's ctrl channel receives the joined broadcast.
+        let ctrl_msg = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            alice_ctrl_rx.recv(),
+        )
+        .await
+        .expect(
+            "Fix-B CommitConfirmed: alice ctrl_rx must receive joined broadcast within 2s\n\
+             Mutation oracle B: comment out broadcast_control in CommitConfirmed arm → timeout → RED",
+        )
+        .expect("Fix-B CommitConfirmed: alice ctrl channel closed");
+        let crate::audio::room::PeerCtrl::Json(joined_json) = ctrl_msg else {
+            panic!("Fix-B CommitConfirmed: expected Json ctrl message, got Close");
+        };
+        let joined: serde_json::Value = serde_json::from_str(&joined_json).unwrap();
+        assert_eq!(
+            joined["type"], "joined",
+            "Fix-B CommitConfirmed: broadcast must be a joined message"
+        );
+        assert_eq!(
+            joined["pubkey"], "bob",
+            "Fix-B CommitConfirmed: broadcast must name the committed peer"
+        );
+
+        // Roster delta channel fires once with a strictly increasing revision.
+        let delta = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            delta_rx.recv().await
+        })
+        .await
+        .expect(
+            "Fix-B CommitConfirmed: roster delta must arrive within 2s\n\
+             Mutation oracle A: comment out commit_peer in CommitConfirmed arm → no delta → \
+             timeout → RED",
+        )
+        .unwrap_or_else(|e| panic!("Fix-B CommitConfirmed: delta channel error: {e:?}"));
+        assert!(
+            delta.revision > pre_bob_revision,
+            "Fix-B CommitConfirmed: delta revision ({}) must be > pre-admission revision ({})",
+            delta.revision,
+            pre_bob_revision
+        );
+        assert_eq!(
+            delta.joined.as_ref().map(|p| p.pubkey.as_str()),
+            Some("bob"),
+            "Fix-B CommitConfirmed: delta must be a joined event for bob"
+        );
+
+        // Exactly one delta (no spurious extra).
+        assert!(
+            delta_rx.try_recv().is_err(),
+            "Fix-B CommitConfirmed: exactly one delta must fire from commit_peer"
+        );
+
+        client.finish().unwrap();
+        drop(client);
+        served.await.unwrap().unwrap();
+    }
 }

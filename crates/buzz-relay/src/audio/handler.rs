@@ -1224,14 +1224,14 @@ pub(crate) async fn handle_active_audio_connection(
             // committed).
             //
             // Error handling: a failed send (encode error or transport error)
-            // must not leave a permanently invisible committed participant. The
-            // owner's `pending_registered` slot is drained when the control
-            // stream closes — so on any send failure we drop `remote_stream`
-            // immediately, triggering EOF on the owner's `serve_control_loop`,
-            // which runs the pending-teardown path and silently removes the
-            // pending slot via `remove_remote_peer_pending`. The peer is
-            // committed in the DB and media flows through the pre-allocated
-            // index; the owner handles the stale slot on stream close.
+            // must not leave the participant invisible. `CommitConfirmed` is
+            // the publication trigger on the owner side; without it, the owner's
+            // `pending_registered` slot stays and nobody sees the peer. We treat
+            // a confirm-send failure as the same condition as `JoinedSendFailed`
+            // — committed join, no owner visibility — and route through the same
+            // teardown: remove peer from the local room (loud, since committed),
+            // send clean close to the owner, emit 48102, return. The client's WS
+            // will be closed so it can rejoin against a fresh owner dial.
             //
             // Hung stream (CommitConfirmed never sent, stream stays open): the
             // owner's `pending_registered` slot stays until the stream closes.
@@ -1240,35 +1240,80 @@ pub(crate) async fn handle_active_audio_connection(
             // and the pending drain fires. A per-slot timeout is not added here;
             // the lease lifetime is the practical upper bound.
             // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
-            if let (Some(stream), Some(pk)) = (
-                guard.remote_stream.as_mut(),
-                guard
-                    .remote_session
-                    .as_ref()
-                    .map(|s| s.pubkey().to_string()),
-            ) {
-                use crate::audio::join::{encode_control, HuddleControlMsg};
-                let fenced = guard
-                    .remote_session
-                    .as_ref()
-                    .expect("remote_stream implies remote_session")
-                    .fenced();
-                let sent = match encode_control(&HuddleControlMsg::CommitConfirmed { pubkey: pk }) {
-                    Ok(payload) => stream
-                        .send_frame(buzz_relay_mesh::MeshStreamFrame::Data { fenced, payload })
-                        .await
-                        .is_ok(),
-                    Err(_) => false,
-                };
-                if !sent {
-                    // Drop the stream so the owner sees EOF and drains the
-                    // pending slot via `remove_remote_peer_pending` on teardown.
-                    tracing::warn!(
-                        "Fix-B: CommitConfirmed send failed; dropping control stream \
-                         so owner drains pending slot on EOF"
-                    );
-                    guard.remote_stream = None;
+            let confirm_send_failed = if let Some(pk) = guard
+                .remote_session
+                .as_ref()
+                .map(|s| s.pubkey().to_string())
+            {
+                if let Some(stream) = guard.remote_stream.as_mut() {
+                    use crate::audio::join::{encode_control, HuddleControlMsg};
+                    let fenced = guard
+                        .remote_session
+                        .as_ref()
+                        .expect("remote_stream implies remote_session")
+                        .fenced();
+                    let sent = match encode_control(&HuddleControlMsg::CommitConfirmed {
+                        pubkey: pk,
+                    }) {
+                        Ok(payload) => stream
+                            .send_frame(buzz_relay_mesh::MeshStreamFrame::Data { fenced, payload })
+                            .await
+                            .is_ok(),
+                        Err(_) => false,
+                    };
+                    !sent
+                } else {
+                    false // no remote stream — same-pod path, nothing to send
                 }
+            } else {
+                false
+            };
+
+            if confirm_send_failed {
+                // CommitConfirmed could not be delivered. The owner never sees the
+                // peer as committed; treat this as JoinedSendFailed (committed join
+                // with no owner visibility). Route through the same teardown so
+                // the invariant `committed join ⇒ exactly one leave` is preserved.
+                tracing::warn!(
+                    "Fix-B: CommitConfirmed send failed; tearing down committed \
+                     join as JoinedSendFailed (committed ⇒ exactly one leave)"
+                );
+                let _ = guard.take_peer_id();
+                room.remove_peer(peer_id);
+                state
+                    .audio_rooms
+                    .cleanup_if_empty(tenant.community(), channel_id);
+                if let (Some(session), Some(ref mut stream)) = (
+                    guard.take_remote_session().as_ref(),
+                    guard.take_remote_stream().as_mut(),
+                ) {
+                    crate::audio::join::send_clean_close(
+                        stream,
+                        session.fenced(),
+                        session.pubkey(),
+                    )
+                    .await;
+                }
+                // Emit 48102 — committed join ⇒ exactly one leave.
+                emit_participant_event(
+                    &state,
+                    &tenant,
+                    channel_id,
+                    parent_id_for_event,
+                    ParticipantLifecycle {
+                        kind: Kind::Custom(48102),
+                        participant_pubkey: &pubkey_hex,
+                        roster_revision: None,
+                        admission_id: Some(peer_id),
+                        generation: &lifecycle_generation,
+                    },
+                )
+                .await;
+                state
+                    .audio_rooms
+                    .cleanup_if_empty(tenant.community(), channel_id);
+                let _ = guard.release_before_commit().await;
+                return;
             }
         }
         Ok(CommitJoinOutcome::JoinedSendFailed) => {
