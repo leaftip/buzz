@@ -910,11 +910,17 @@ mod tests {
 
         // The cancellation arm must NOT produce a second terminal frame —
         // quiesce() only waits, never enqueues.
+        // Note: replacing quiesce() with expire() MAY or MAY NOT produce a second
+        // frame depending on whether the admin path has already won the reason slot
+        // (expire() is winner-only: if the reason is already set by the admin path
+        // it skips enqueue).  The assertion here proves that quiesce() on its own
+        // does not enqueue — it makes no claim about expire() behaviour.
         assert!(
             terminal_rx.try_recv().is_err(),
             "W_f5_registry: terminal channel must be empty after task completion \
-             (quiesce does not enqueue; admin path already enqueued exactly one frame). \
-             Mutation B: replace quiesce() with expire() → second frame → this panics."
+             (quiesce does not enqueue — proved by admin path having already won \
+             the reason slot before quiesce ran, and quiesce() containing no \
+             enqueue call of its own)"
         );
     }
 
@@ -1115,9 +1121,18 @@ mod tests {
     //   - Zero subscription orphans after teardown remove_connection.
     //
     // Mutation evidence:
-    //   A) Remove `gate.quiesce().await` → task exits before subscription
-    //      registered → remove_connection finds nothing → removed.len() != 1
-    //      → assertion panics.
+    //   A) Remove `gate.quiesce().await` → task can exit before step 5's
+    //      `register_scoped` in this test, but note: this test calls
+    //      register_scoped unconditionally before remove_connection, so the
+    //      ordering within the test is always correct.
+    //      The mutation's real falsifiable claim is production-level: in the
+    //      real handler a REQ arrives WHILE the expiry task is running; without
+    //      quiescence the task exits before registration and the subscription
+    //      orphans permanently.  This test proves quiescence BLOCKS the task
+    //      until the permit is released — an insertion after permit-drop would
+    //      be lost, but step 5 occurs while the task is blocked, so the remove
+    //      finds exactly 1.  Remove quiesce → task_handle.is_finished() before
+    //      step 5 → the is_finished assertion at step 4 panics.
     //   B) Replace admin `registry.disconnect_nip_fi` with raw `cancel.cancel()`
     //      → no terminal frame enqueued → first try_recv assertion panics.
     #[tokio::test]
@@ -1228,9 +1243,10 @@ mod tests {
             removed.len(),
             1,
             "W_f5_teardown: remove_connection must find exactly 1 subscription — \
-             the one registered while quiesce was blocked. \
-             Mutation A: remove quiesce() → task exits early → registration happens \
-             after teardown → orphan (this fails: zero removed)"
+             the one registered in step 5 while quiesce was blocked. \
+             (Note: in this test register_scoped is unconditionally called before \
+             remove_connection; the quiescence proof is the task.is_finished() \
+             check above, not this assertion)"
         );
 
         // Zero orphans remain — complete cleanup.

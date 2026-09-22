@@ -550,10 +550,12 @@ pub(crate) async fn handle_active_audio_connection(
     }
 
     // Shared finalization for explicit pre-writer error exits after terminal
-    // registration.  Drains any denial frame already enqueued by a concurrent
-    // admin/expiry path and sends the matching policy close code, so a denial
-    // that raced in while the membership or protocol check was awaiting is
-    // never silently discarded.  Used at every error return between terminal
+    // registration.  Serializes with the winning producer by calling
+    // `lifecycle_cancel()` (which acquires the transition lock, ensuring any
+    // in-flight producer completes its `try_send` before the drain runs),
+    // awaits the expiry task so its frame is committed, then drains any denial
+    // frame already enqueued by a concurrent admin/expiry path and sends the
+    // matching policy close code.  Used at every error return between terminal
     // registration and send_loop startup.  [R2: invariant boundary — Fix-2]
     //
     // Unlike check_cancel!() this is unconditional: the handler is returning
@@ -564,7 +566,43 @@ pub(crate) async fn handle_active_audio_connection(
     //
     // Sends are bounded by a 1-second flush deadline so a stalled WS sink
     // cannot hold the handler indefinitely on an error exit.
+    //
+    // Parameters:
+    //   $control    — the CommunityConnectionControl for this session
+    //   $expiry     — &mut Option<JoinHandle<_>> for the admission expiry task
     macro_rules! drain_terminal {
+        ($control:expr, $expiry:expr) => {{
+            use futures_util::SinkExt as _;
+            // Serialization: lifecycle_cancel acquires the transition lock,
+            // ensuring any producer that has won the reason but not yet called
+            // try_send completes its enqueue before the drain below runs.
+            // Without this, the drain could see an empty channel and discard
+            // the winning denial payload.  [R2: producer serialization]
+            $control.lifecycle_cancel();
+            // Await the expiry task so its try_send is committed before we
+            // drain.  take() prevents double-await in later code.
+            if let Some(t) = $expiry.take() {
+                let _ = t.await;
+            }
+            let _drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                let _ = tokio::time::timeout_at(_drain_deadline, ws_send.send(msg)).await;
+            }
+            let nip_fi_close_reason = *disconnect_reason.borrow();
+            if let Some(reason) = nip_fi_close_reason {
+                let _ =
+                    tokio::time::timeout_at(_drain_deadline, ws_send.send(reason.close_message()))
+                        .await;
+            }
+        }};
+    }
+
+    // Bounded drain+close after lifecycle_cancel() and expiry-await are already
+    // called explicitly by the caller.  Applies the same 1-second flush deadline
+    // as drain_terminal! but skips the serialization step.  Used at post-guard
+    // error exits where lifecycle_cancel + expiry.take().await precede this
+    // in the same code path.  [R2: bounded delivery — Fix-2]
+    macro_rules! finalize_drain {
         () => {{
             use futures_util::SinkExt as _;
             let _drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -591,17 +629,20 @@ pub(crate) async fn handle_active_audio_connection(
     .is_err()
     {
         warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio: relay membership denied");
-        let _ = ws_send
-            .send(WsMessage::Text(
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ws_send.send(WsMessage::Text(
                 serde_json::json!({"type": "error", "message": "restricted: not a relay member"})
                     .to_string()
                     .into(),
-            ))
-            .await;
+            )),
+        )
+        .await;
         // Drain any concurrent denial that raced in while the membership check
         // was awaiting — terminal_ctrl_rx holds the denial frame, disconnect_reason
-        // holds the close code.  [R2: pre-writer invariant boundary]
-        drain_terminal!();
+        // holds the close code.  Diagnostic send above is bounded; drain below
+        // applies its own 1-second deadline.  [R2: bounded delivery]
+        drain_terminal!(control, _nip_fi_admission_expiry);
         return;
     }
     // Test hook: fires immediately before the first check_cancel!() so W_FIX1
@@ -633,7 +674,7 @@ pub(crate) async fn handle_active_audio_connection(
                 ))
                 .await;
             // [R2: pre-writer invariant boundary]
-            drain_terminal!();
+            drain_terminal!(control, _nip_fi_admission_expiry);
             return;
         }
     };
@@ -682,7 +723,7 @@ pub(crate) async fn handle_active_audio_connection(
                     ))
                     .await;
                 // [R2: pre-writer invariant boundary]
-                drain_terminal!();
+                drain_terminal!(control, _nip_fi_admission_expiry);
                 return;
             }
             match crate::audio::join::resolve_join_owner_ready(
@@ -720,7 +761,7 @@ pub(crate) async fn handle_active_audio_connection(
                         ))
                         .await;
                     // [R2: pre-writer invariant boundary]
-                    drain_terminal!();
+                    drain_terminal!(control, _nip_fi_admission_expiry);
                     return;
                 }
             }
@@ -747,7 +788,7 @@ pub(crate) async fn handle_active_audio_connection(
                     ))
                     .await;
                 // [R2: pre-writer invariant boundary]
-                drain_terminal!();
+                drain_terminal!(control, _nip_fi_admission_expiry);
                 return;
             }
         }
@@ -788,7 +829,7 @@ pub(crate) async fn handle_active_audio_connection(
                 .audio_rooms
                 .cleanup_if_empty(tenant.community(), channel_id);
             // [R2: pre-writer invariant boundary]
-            drain_terminal!();
+            drain_terminal!(control, _nip_fi_admission_expiry);
             return;
         }
         Err(e) => {
@@ -803,7 +844,7 @@ pub(crate) async fn handle_active_audio_connection(
                 .audio_rooms
                 .cleanup_if_empty(tenant.community(), channel_id);
             // [R2: pre-writer invariant boundary]
-            drain_terminal!();
+            drain_terminal!(control, _nip_fi_admission_expiry);
             return;
         }
         Ok(_) => {} // Channel exists and is not archived — proceed.
@@ -844,7 +885,7 @@ pub(crate) async fn handle_active_audio_connection(
             }
         }
         // [R2: pre-writer invariant boundary]
-        drain_terminal!();
+        drain_terminal!(control, _nip_fi_admission_expiry);
         return;
     }
 
@@ -912,14 +953,8 @@ pub(crate) async fn handle_active_audio_connection(
                 }
                 guard.release_before_commit().await;
                 // Drain any denial frame queued by the expiry task.
-                use futures_util::SinkExt as _;
-                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                    let _ = ws_send.send(msg).await;
-                }
-                let nip_fi_close_reason = *disconnect_reason.borrow();
-                if let Some(reason) = nip_fi_close_reason {
-                    let _ = ws_send.send(reason.close_message()).await;
-                }
+                // Bounded by 1-second deadline. [R2: bounded delivery — Fix-2]
+                finalize_drain!();
                 state
                     .audio_rooms
                     .cleanup_if_empty(tenant.community(), channel_id);
@@ -948,14 +983,8 @@ pub(crate) async fn handle_active_audio_connection(
                 }
                 guard.release_before_commit().await;
                 // Drain any denial frame queued by the expiry task.
-                use futures_util::SinkExt as _;
-                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                    let _ = ws_send.send(msg).await;
-                }
-                let nip_fi_close_reason = *disconnect_reason.borrow();
-                if let Some(reason) = nip_fi_close_reason {
-                    let _ = ws_send.send(reason.close_message()).await;
-                }
+                // Bounded by 1-second deadline. [R2: bounded delivery — Fix-2]
+                finalize_drain!();
                 state
                     .audio_rooms
                     .cleanup_if_empty(tenant.community(), channel_id);
@@ -973,17 +1002,9 @@ pub(crate) async fn handle_active_audio_connection(
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
-            use futures_util::SinkExt as _;
             guard.release_before_commit().await;
-            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                let _ = ws_send.send(msg).await;
-            }
-            // Emit the policy close frame for a NIP-FI expiry at this
-            // boundary. [FI-TRACE-CLOSE-CODE, Fix-1]
-            let nip_fi_close_reason = *disconnect_reason.borrow();
-            if let Some(reason) = nip_fi_close_reason {
-                let _ = ws_send.send(reason.close_message()).await;
-            }
+            // Bounded drain+close. [R2: bounded delivery — Fix-2]
+            finalize_drain!();
             return;
         }
     }
@@ -1025,17 +1046,9 @@ pub(crate) async fn handle_active_audio_connection(
                 if let Some(t) = _nip_fi_admission_expiry.take() {
                     let _ = t.await;
                 }
-                use futures_util::SinkExt as _;
                 guard.release_before_commit().await;
-                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                    let _ = ws_send.send(msg).await;
-                }
-                // Emit the policy close frame for a NIP-FI expiry at this
-                // boundary. [FI-TRACE-CLOSE-CODE, Fix-1]
-                let nip_fi_close_reason = *disconnect_reason.borrow();
-                if let Some(reason) = nip_fi_close_reason {
-                    let _ = ws_send.send(reason.close_message()).await;
-                }
+                // Bounded drain+close. [R2: bounded delivery — Fix-2]
+                finalize_drain!();
                 return;
             }
         };
@@ -1061,7 +1074,11 @@ pub(crate) async fn handle_active_audio_connection(
             Ok(v) => v,
             Err(crate::audio::room::AdmissionError::Full) => {
                 warn!(channel_id = %channel_id, "audio room participant capacity reached");
-                let _ = ws_send.send(WsMessage::Text(serde_json::json!({"type":"error","code":"room_full","message":"room participant capacity reached"}).to_string().into())).await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    ws_send.send(WsMessage::Text(serde_json::json!({"type":"error","code":"room_full","message":"room participant capacity reached"}).to_string().into())),
+                )
+                .await;
                 // IMPORTANT 3: cancel + await expiry task before guard release.
                 // B2: lifecycle_cancel holds transition lock. [FI-TRACE-CANCEL-RACE, B2 fix]
                 control.lifecycle_cancel();
@@ -1069,21 +1086,17 @@ pub(crate) async fn handle_active_audio_connection(
                     let _ = t.await;
                 }
                 guard.release_before_commit().await;
-                // R2: deliver any already-winning denial frame + close before
-                // dropping the socket.  The send_loop is not yet started so
-                // ws_send is directly owned here.  [FI-INV-05, R2 fix]
-                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                    let _ = ws_send.send(msg).await;
-                }
-                let nip_fi_close_reason = *disconnect_reason.borrow();
-                if let Some(reason) = nip_fi_close_reason {
-                    let _ = ws_send.send(reason.close_message()).await;
-                }
+                // R2: bounded drain+close. [FI-INV-05, R2 fix — bounded delivery]
+                finalize_drain!();
                 return;
             }
             Err(crate::audio::room::AdmissionError::Ended) => {
                 debug!(channel_id = %channel_id, "room ended before admission");
-                let _ = ws_send.send(WsMessage::Text(serde_json::json!({"type":"error","code":"room_ended","message":"huddle has ended"}).to_string().into())).await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    ws_send.send(WsMessage::Text(serde_json::json!({"type":"error","code":"room_ended","message":"huddle has ended"}).to_string().into())),
+                )
+                .await;
                 // Test hook: fires after the room_ended error frame is sent and
                 // before lifecycle_cancel.  Used by R2 witness: a concurrent admin
                 // disconnect fires here (wins reason, enqueues denial frame), then
@@ -1099,23 +1112,21 @@ pub(crate) async fn handle_active_audio_connection(
                     let _ = t.await;
                 }
                 guard.release_before_commit().await;
-                // R2: deliver any already-winning denial frame + close. [FI-INV-05, R2 fix]
-                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                    let _ = ws_send.send(msg).await;
-                }
-                let nip_fi_close_reason = *disconnect_reason.borrow();
-                if let Some(reason) = nip_fi_close_reason {
-                    let _ = ws_send.send(reason.close_message()).await;
-                }
+                // R2: bounded drain+close. [FI-INV-05, R2 fix — bounded delivery]
+                finalize_drain!();
                 return;
             }
             Err(crate::audio::room::AdmissionError::VersionMismatch { pinned, requested }) => {
                 info!(channel_id = %channel_id, pubkey = %pubkey_hex, pinned, requested, "audio: protocol version mismatch — upgrade required");
-                let _ = ws_send.send(WsMessage::Text(serde_json::json!({
-                "type": "error", "code": "upgrade_required",
-                "message": format!("this huddle is using audio protocol v{pinned}; your client requested v{requested}"),
-                "pinned_version": pinned, "requested_version": requested,
-            }).to_string().into())).await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    ws_send.send(WsMessage::Text(serde_json::json!({
+                    "type": "error", "code": "upgrade_required",
+                    "message": format!("this huddle is using audio protocol v{pinned}; your client requested v{requested}"),
+                    "pinned_version": pinned, "requested_version": requested,
+                }).to_string().into())),
+                )
+                .await;
                 // IMPORTANT 3: cancel + await expiry task before guard release.
                 // B2: lifecycle_cancel holds transition lock. [FI-TRACE-CANCEL-RACE, B2 fix]
                 control.lifecycle_cancel();
@@ -1123,14 +1134,8 @@ pub(crate) async fn handle_active_audio_connection(
                     let _ = t.await;
                 }
                 guard.release_before_commit().await;
-                // R2: deliver any already-winning denial frame + close. [FI-INV-05, R2 fix]
-                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                    let _ = ws_send.send(msg).await;
-                }
-                let nip_fi_close_reason = *disconnect_reason.borrow();
-                if let Some(reason) = nip_fi_close_reason {
-                    let _ = ws_send.send(reason.close_message()).await;
-                }
+                // R2: bounded drain+close. [FI-INV-05, R2 fix — bounded delivery]
+                finalize_drain!();
                 return;
             }
         };
@@ -1158,17 +1163,9 @@ pub(crate) async fn handle_active_audio_connection(
         if let Some(t) = _nip_fi_admission_expiry.take() {
             let _ = t.await;
         }
-        use futures_util::SinkExt as _;
         guard.release_before_commit().await;
-        while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-            let _ = ws_send.send(msg).await;
-        }
-        // Emit the policy close frame for a NIP-FI expiry at this
-        // boundary. [FI-TRACE-CLOSE-CODE, Fix-1]
-        let nip_fi_close_reason = *disconnect_reason.borrow();
-        if let Some(reason) = nip_fi_close_reason {
-            let _ = ws_send.send(reason.close_message()).await;
-        }
+        // Bounded drain+close. [R2: bounded delivery — Fix-2]
+        finalize_drain!();
         return;
     }
 
@@ -1385,16 +1382,8 @@ pub(crate) async fn handle_active_audio_connection(
             // `guard.release_before_commit()` directly awaits directory.release().
             guard.release_before_commit().await;
             // Drain the terminal denial frame (already queued by expiry task).
-            use futures_util::SinkExt as _;
-            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                let _ = ws_send.send(msg).await;
-            }
-            // Emit the policy close frame for the NIP-FI expiry denial.
-            // [FI-TRACE-CLOSE-CODE, Fix-1]
-            let nip_fi_close_reason = *disconnect_reason.borrow();
-            if let Some(reason) = nip_fi_close_reason {
-                let _ = ws_send.send(reason.close_message()).await;
-            }
+            // Bounded by 1-second deadline. [R2: bounded delivery — Fix-2]
+            finalize_drain!();
             return;
         }
         Err(JoinCommitError::Archived) => {
@@ -1409,21 +1398,17 @@ pub(crate) async fn handle_active_audio_connection(
             }
             // I1: lease is still guard-owned; guard.release_before_commit() releases it.
             guard.release_before_commit().await;
-            let _ = ws_send
-                .send(WsMessage::Text(
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                ws_send.send(WsMessage::Text(
                     serde_json::json!({"type":"error","message":"huddle has ended"})
                         .to_string()
                         .into(),
-                ))
-                .await;
-            // R2: deliver any already-winning denial frame + close. [FI-INV-05, R2 fix]
-            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                let _ = ws_send.send(msg).await;
-            }
-            let nip_fi_close_reason = *disconnect_reason.borrow();
-            if let Some(reason) = nip_fi_close_reason {
-                let _ = ws_send.send(reason.close_message()).await;
-            }
+                )),
+            )
+            .await;
+            // R2: bounded drain+close. [FI-INV-05, R2 fix — bounded delivery]
+            finalize_drain!();
             return;
         }
         Err(JoinCommitError::ParentMembershipLost) => {
@@ -1438,21 +1423,17 @@ pub(crate) async fn handle_active_audio_connection(
             }
             // I1: lease is still guard-owned; guard.release_before_commit() releases it.
             guard.release_before_commit().await;
-            let _ = ws_send
-                .send(WsMessage::Text(
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                ws_send.send(WsMessage::Text(
                     serde_json::json!({"type":"error","message":"error: not a member"})
                         .to_string()
                         .into(),
-                ))
-                .await;
-            // R2: deliver any already-winning denial frame + close. [FI-INV-05, R2 fix]
-            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                let _ = ws_send.send(msg).await;
-            }
-            let nip_fi_close_reason = *disconnect_reason.borrow();
-            if let Some(reason) = nip_fi_close_reason {
-                let _ = ws_send.send(reason.close_message()).await;
-            }
+                )),
+            )
+            .await;
+            // R2: bounded drain+close. [FI-INV-05, R2 fix — bounded delivery]
+            finalize_drain!();
             return;
         }
         Err(JoinCommitError::HuddleLinkGone) => {
@@ -1468,21 +1449,17 @@ pub(crate) async fn handle_active_audio_connection(
             }
             // I1: lease is still guard-owned; guard.release_before_commit() releases it.
             guard.release_before_commit().await;
-            let _ = ws_send
-                .send(WsMessage::Text(
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                ws_send.send(WsMessage::Text(
                     serde_json::json!({"type":"error","message":"huddle has ended"})
                         .to_string()
                         .into(),
-                ))
-                .await;
-            // R2: deliver any already-winning denial frame + close. [FI-INV-05, R2 fix]
-            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                let _ = ws_send.send(msg).await;
-            }
-            let nip_fi_close_reason = *disconnect_reason.borrow();
-            if let Some(reason) = nip_fi_close_reason {
-                let _ = ws_send.send(reason.close_message()).await;
-            }
+                )),
+            )
+            .await;
+            // R2: bounded drain+close. [FI-INV-05, R2 fix — bounded delivery]
+            finalize_drain!();
             return;
         }
         Err(JoinCommitError::Db(e)) => {
@@ -1497,21 +1474,17 @@ pub(crate) async fn handle_active_audio_connection(
             }
             // I1: lease is still guard-owned; guard.release_before_commit() releases it.
             guard.release_before_commit().await;
-            let _ = ws_send
-                .send(WsMessage::Text(
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                ws_send.send(WsMessage::Text(
                     serde_json::json!({"type":"error","message":"error: join commit failed"})
                         .to_string()
                         .into(),
-                ))
-                .await;
-            // R2: deliver any already-winning denial frame + close. [FI-INV-05, R2 fix]
-            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                let _ = ws_send.send(msg).await;
-            }
-            let nip_fi_close_reason = *disconnect_reason.borrow();
-            if let Some(reason) = nip_fi_close_reason {
-                let _ = ws_send.send(reason.close_message()).await;
-            }
+                )),
+            )
+            .await;
+            // R2: bounded drain+close. [FI-INV-05, R2 fix — bounded delivery]
+            finalize_drain!();
             return;
         }
     }
@@ -5591,6 +5564,206 @@ mod tests {
         );
     }
 
+    // ── F3 wire: real admission produces 48101 JOIN with correct generation ──
+    //
+    // Drives the real `handle_active_audio_connection` handler through a full
+    // admission to a committed 48101 JOIN event.  Pauses at
+    // `after_participant_fanout` (TX committed, fan-out done), then reads the
+    // actual 48101 wire bytes from the DB and asserts that
+    // `content.generation` equals `state.huddle_liveness_generation.to_string()`.
+    //
+    // This directly tests the production Off-mode fallback at
+    // `audio/handler.rs:802`:
+    //   `state.huddle_liveness_generation.to_string()`
+    //
+    // Falsifying counterexample per Thufir: change line 802 to a hardcoded UUID.
+    // The existing `f3_commit_participant_join_includes_lifecycle_generation` test
+    // supplies `state.huddle_liveness_generation` as its INPUT and would not
+    // detect this regression.  THIS test reads the committed content FROM the wire
+    // bytes and compares it against the same source — the hardcoded UUID would
+    // disagree, and this test panics.
+    //
+    // Mutation evidence:
+    //   A) Change `audio/handler.rs:802` to a hardcoded UUID →
+    //      committed 48101 content.generation != state.huddle_liveness_generation →
+    //      assertion panics.
+    //   B) Remove `"generation": lifecycle_generation` from commit content →
+    //      `content_json["generation"]` is null → as_str() returns None →
+    //      assert_eq panics (generation_from_wire != expected_generation).
+    //   C) Delete `after_participant_fanout(...)` → arrived_rx times out → panics.
+    //
+    // Requires Postgres for the full commit path.
+    async fn f3_wire_admission_generation_matches_liveness_source_body() {
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+        use tokio_tungstenite::connect_async;
+
+        let state = audio_test_state_real_db().await.expect(
+            "F3 wire: DB must be available (test is marked #[ignore = \"requires Postgres\"])",
+        );
+        let pool = state.db.pool().clone();
+        let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
+        let community = tenant.community();
+
+        // Far-future deadline — admission completes before any expiry.
+        let assertion = VerifiedAssertion::for_test(
+            Some(member_key.public_key()),
+            vec![Utc::now() + Duration::hours(1)],
+        );
+
+        let conn_cancel = CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+        let conn_cancel_c = conn_cancel.clone();
+        let tenant_host = tenant_c.host().to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("F3 wire: bind listener");
+        let addr = listener.local_addr().expect("F3 wire: listener addr");
+
+        // Arm after_participant_fanout BEFORE spawning server to avoid a race.
+        let (fanout_rx, fanout_release) =
+            crate::nip_fi_test_hooks::audio_participant_fanout_hook::arm(community);
+
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    let cancel_i = conn_cancel_c.clone();
+                    move |ws: axum::extract::ws::WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let conn_time = chrono::Utc::now();
+                        let control_inner =
+                            crate::state::CommunityConnectionControl::new(cancel_i.clone());
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    channel_id,
+                                    control_inner,
+                                    Some(assertion_i),
+                                    conn_time,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app)
+                .await
+                .expect("F3 wire: test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("F3 wire: server ready");
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("F3 wire: connect client");
+
+        // NIP-42 auth exchange.
+        let challenge_msg = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("F3 wire: challenge timeout")
+            .expect("F3 wire: challenge item")
+            .expect("F3 wire: challenge message");
+        let challenge_text = match challenge_msg {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("F3 wire: expected text challenge; got {other:?}"),
+        };
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&challenge_text).expect("F3 wire: challenge JSON");
+        let challenge = challenge_json["challenge"]
+            .as_str()
+            .expect("F3 wire: challenge field")
+            .to_string();
+
+        let relay_url = format!("ws://{tenant_host}");
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&member_key)
+            .unwrap();
+        let auth_msg = serde_json::json!({
+            "type": "auth",
+            "event": auth_event,
+            "parent_channel_id": null,
+            "protocol_version": 1,
+        })
+        .to_string();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                auth_msg.into(),
+            ))
+            .await
+            .expect("F3 wire: send auth");
+
+        // Wait for after_participant_fanout: 48101 is committed and fan-out done.
+        // The production Off-mode generation selection (audio/handler.rs:802) has run.
+        tokio::time::timeout(std::time::Duration::from_secs(10), fanout_rx)
+            .await
+            .expect(
+                "F3 wire: handler must reach after_participant_fanout within 10s                  (proves commit path ran and 48101 is committed with production generation)",
+            )
+            .expect("F3 wire: fanout channel closed");
+
+        // ── Read the actual 48101 wire bytes from DB ──────────────────────
+        let content_str: String = sqlx::query_scalar(
+            "SELECT content::text FROM events              WHERE community_id = $1 AND channel_id = $2 AND kind = 48101              ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(community.as_uuid())
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .expect("F3 wire: 48101 row must exist after commit");
+
+        let content_json: serde_json::Value =
+            serde_json::from_str(&content_str).expect("F3 wire: 48101 content must be valid JSON");
+
+        // The generation in the wire bytes comes from production audio/handler.rs:802.
+        // This is the Off-mode fallback: state.huddle_liveness_generation.to_string().
+        // If that line is changed to a hardcoded UUID, this assertion fails.
+        let generation_from_wire = content_json["generation"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        // The authoritative source that both the admission handler and the liveness
+        // consumer (req.rs handle_huddle_liveness_req) use for Off-mode rooms.
+        let expected_generation = state.huddle_liveness_generation.to_string();
+
+        assert_eq!(
+            generation_from_wire,
+            expected_generation,
+            "F3 wire: 48101 JOIN content.generation from wire bytes ({generation_from_wire})              must equal state.huddle_liveness_generation ({expected_generation}).              Both production paths (admission handler + liveness consumer) read the same field.              A mismatch here means Desktop reconciliation would clear admissions.              Mutation A: change audio/handler.rs:802 to a hardcoded UUID → fails here."
+        );
+
+        assert!(
+            !generation_from_wire.is_empty(),
+            "F3 wire: 48101 content.generation must be non-empty in wire bytes.              Mutation B: remove generation field from commit content → empty string → panics."
+        );
+
+        // Cleanup: release hook and disconnect.
+        fanout_release.notify_one();
+        conn_cancel.cancel();
+        server.abort();
+        let _ = server.await;
+    }
+
     // ── W10: two concurrent committers; expiry during second; first row intact ──
     //
     // Two concurrent tasks call `commit_participant_join` for different pubkeys.
@@ -7487,16 +7660,18 @@ mod tests {
         let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
         let community_id = tenant.community();
 
-        // Assertion: matching key, far-future deadline so the gate does NOT
-        // self-expire before the test intercepts at the hook.  The test will
-        // cancel from outside.
+        // Assertion: matching key.  Deadline is set to one second in the past so
+        // the gate IS already elapsed when the test hook releases.  This exercises
+        // the `Utc::now() >= deadline` branch in `nip_fi_gate.rs:136-143`, NOT
+        // a raw-cancel path.  The expiry task's `select!` will see the elapsed
+        // wall-clock check immediately after the hook releases.  [F4: elapsed-deadline path]
         let assertion = VerifiedAssertion::for_test(
             Some(member_key.public_key()),
-            vec![Utc::now() + Duration::hours(1)],
+            vec![Utc::now() - Duration::seconds(1)],
         );
 
         let conn_cancel = CancellationToken::new();
-        let cancel_for_test = conn_cancel.clone();
+        let _cancel_for_test = conn_cancel.clone(); // not used — deadline provides expiry
 
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         let state_c = Arc::clone(&state);
@@ -7601,11 +7776,9 @@ mod tests {
             .expect("F4 add-peer: handler must reach before_add_peer_gate_acquire within 10s")
             .expect("F4 add-peer: hook arrived channel closed");
 
-        // Cancel from test side: simulates late-firing expiry (deadline elapsed
-        // between auth and add-peer).  acquire_effect() will return SessionExpired.
-        cancel_for_test.cancel();
-
-        // Release the hook: handler resumes → acquire_effect() → SessionExpired
+        // Release the hook: handler resumes → acquire_effect() sees Utc::now() >= deadline
+        // (elapsed 1 second ago) → SessionExpired via nip_fi_gate.rs:136-143 deadline branch.
+        // No external cancel needed — the elapsed deadline is sufficient.  [F4: elapsed-deadline path]
         // → expiry_deny_terminal → lifecycle_cancel → R2 drain → send frames.
         hook_release.notify_one();
 
@@ -7691,14 +7864,17 @@ mod tests {
         let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
         let community_id = tenant.community();
 
-        // Far-future deadline: the expiry task will not self-fire; we cancel manually.
+        // Deadline set to one second in the past so the gate IS already elapsed.
+        // Exercises the `Utc::now() >= deadline` branch in `nip_fi_gate.rs:136-143`.
+        // No external cancel is needed — the elapsed deadline causes acquire_effect()
+        // to return SessionExpired when the hook releases.  [F4: elapsed-deadline path]
         let assertion = VerifiedAssertion::for_test(
             Some(member_key.public_key()),
-            vec![Utc::now() + Duration::hours(1)],
+            vec![Utc::now() - Duration::seconds(1)],
         );
 
         let conn_cancel = CancellationToken::new();
-        let cancel_for_test = conn_cancel.clone();
+        let _cancel_for_test = conn_cancel.clone(); // not used — deadline provides expiry
 
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         let state_c = Arc::clone(&state);
@@ -7803,12 +7979,10 @@ mod tests {
             .expect("F4 commit: handler must reach before_participant_commit within 15s")
             .expect("F4 commit: hook arrived channel closed");
 
-        // Cancel from test side.
-        cancel_for_test.cancel();
-
-        // Release: commit_participant_join returns Err(JoinCommitError::Expired).
-        // Handler's Expired arm: expiry_deny_terminal → lifecycle_cancel → R2 drain
-        // → send denial frame + close.
+        // Release: commit_participant_join resumes → acquire_effect() sees elapsed deadline
+        // → returns Err(JoinCommitError::Expired).  Handler's Expired arm:
+        // expiry_deny_terminal → lifecycle_cancel → R2 drain → send denial frame + close.
+        // [F4: elapsed-deadline path — nip_fi_gate.rs:136-143]
         hook_release.notify_one();
 
         // Frame 0: Audio authorization-denied JSON payload.
@@ -8111,6 +8285,21 @@ mod tests {
         #[ignore = "requires Postgres"]
         async fn f3_commit_participant_join_includes_lifecycle_generation() {
             super::f3_commit_participant_join_includes_lifecycle_generation_body().await;
+        }
+
+        /// F3 (wire): real admission → actual 48101 JOIN wire bytes → generation field
+        /// matches `state.huddle_liveness_generation` — the production Off-mode fallback
+        /// at `audio/handler.rs:802`.
+        ///
+        /// This is the production-bound complement to `f3_commit_participant_join_includes_lifecycle_generation`:
+        /// it drives the real handler to a committed JOIN, reads the actual wire bytes from
+        /// the DB, and asserts the generation field against the authoritative source.
+        /// Changing line 802 to a hardcoded UUID would fail this test but NOT the direct
+        /// `commit_participant_join` test (which supplies the generation as an input).
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn f3_wire_admission_generation_matches_liveness_source() {
+            super::f3_wire_admission_generation_matches_liveness_source_body().await;
         }
 
         /// F4 (add-peer path): handler's `SessionExpired` arm at `audio_gate.acquire_effect()`

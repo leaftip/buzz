@@ -353,3 +353,29 @@ make_hook!(
     audio_room_ended_lifecycle_cancel_hook,
     before_room_ended_lifecycle_cancel
 );
+// ── F5: REQ permit-acquired hook ──────────────────────────────────────────
+// `after_req_permit_acquired`: fires in `handlers/req.rs` immediately AFTER
+// `acquire_effect()` returns `Ok(permit)` (permit is now held) but BEFORE
+// `sub_registry.register_scoped` / `register_channels_scoped`.
+//
+// This hook establishes a permit-holding REQ handler that has not yet
+// registered its subscription. The F5 loopback teardown witness uses this
+// to drive a real `handle_active_connection` to this state, fire admin
+// disconnect, then release — letting the real connection epilogue
+// (`remove_connection` + `release_topic`) run and asserting zero topic
+// refcounts remain.
+//
+// Mutation evidence (F5 loopback test):
+//   A) Remove `gate.quiesce().await` from the expiry task cancel arm →
+//      expiry task exits before REQ registers its subscription →
+//      connection epilogue runs `remove_connection` on an empty set →
+//      the subscription registered after task exit orphans permanently →
+//      but the test actually fires disconnect WHILE the permit is held, so
+//      quiescence is still the binding contract.
+//   B) Remove `acquire_effect()` from req.rs → handler inserts subscription
+//      without the permit → quiescence barrier not crossed → subscription
+//      is registered after task exits → `remove_connection` finds 0 entries →
+//      topic_refcount stays > 0 → assertion panics.
+//   C) Delete `after_req_permit_acquired(...)` from req.rs →
+//      `arrived_rx` times out → test panics (proves hook is at correct seam).
+make_hook!(req_permit_acquired_hook, after_req_permit_acquired);

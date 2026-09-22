@@ -2855,4 +2855,229 @@ pub(crate) mod tests {
             other => panic!("R1: last frame must be Close, got {other:?}"),
         }
     }
+
+    // ── F5 loopback teardown: real connection epilogue removes subs + topic refcounts ──
+    //
+    // Proves the complete F5 teardown boundary using the production
+    // `handle_active_connection` call path and real `ConnectionManager`/`sub_registry`/
+    // `pubsub` infrastructure — no synthetic setup.
+    //
+    // Sequence:
+    //   1. Build test state (no Postgres needed — gate is live, pubsub uses real
+    //      in-memory manager, sub_registry is real).
+    //   2. Start a plain loopback WS server calling `handle_active_connection`.
+    //   3. Connect + complete NIP-42 auth (registers pubkey in conn_manager).
+    //   4. Send a REQ ["REQ", "sub1", {}].  Handler acquires effect permit and
+    //      pauses at `after_req_permit_acquired` hook (permit is held).
+    //   5. Call `state.conn_manager.disconnect_nip_fi(pubkey)` from the test.
+    //      This: wins reason → enqueues denial frame → fires cancel.
+    //      The expiry task is now in quiescence (write lock blocked by permit).
+    //   6. Release hook → handler proceeds: registers subscription in sub_registry,
+    //      retains Global topic in pubsub, finishes REQ, drops permit.
+    //   7. Quiescence unblocks → expiry task completes.
+    //   8. recv_loop detects cancel → connection epilogue:
+    //        nip_fi_expiry_task.await (already done)
+    //        sub_registry.remove_connection → 0 subscriptions
+    //        pubsub.release_topic(Global) → 0 topic refcounts
+    //   9. Wait for connection_finished.
+    //  10. Assert: total_subscriptions() == 0 and topic_refcount(Global) == 0.
+    //
+    // Mutation evidence:
+    //   A) Remove `gate.quiesce().await` from expiry task cancel arm →
+    //      task exits before REQ registers → remove_connection finds nothing →
+    //      sub orphans after hook release → total_subscriptions() stays 1 at step 10
+    //      if the connection_finished fires before remove_connection (hard race).
+    //      More reliably: `task_handle.is_finished()` check added below panics.
+    //   B) Remove `sub_registry.remove_connection` from connection epilogue →
+    //      sub never removed → total_subscriptions() stays 1 → assertion panics.
+    //   C) Remove `pubsub.release_topic` from connection epilogue →
+    //      topic refcount stays 1 → assertion panics.
+    //   D) Delete `after_req_permit_acquired(...)` from req.rs →
+    //      arrived_rx times out → test panics (proves hook is at correct seam).
+    //
+    // No Postgres required — this test uses the off-DB paths only (REQ with an
+    // empty filter returns EOSE immediately; no rows read from DB).
+    #[tokio::test]
+    async fn f5_loopback_teardown_epilogue_removes_subscription_and_topic_refcount() {
+        use axum::{extract::ws::WebSocketUpgrade, routing::get, Router};
+        use buzz_auth::VerifiedAssertion;
+        use buzz_pubsub::EventTopic;
+        use chrono::{Duration, Utc};
+        use nostr::{EventBuilder, Keys, RelayUrl};
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let state = crate::state::tests::test_state().await;
+        let tenant = TenantContext::resolved(
+            buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+            "test.local".to_owned(),
+        );
+        // Far-future deadline so the gate is live but does NOT self-expire.
+        // disconnect_nip_fi provides the deny path; the expiry task enters
+        // quiescence when cancel fires.
+        let member_keys = Keys::generate();
+        let assertion = VerifiedAssertion::for_test(
+            Some(member_keys.public_key()),
+            vec![Utc::now() + Duration::hours(1)],
+        );
+        let pubkey_bytes = member_keys.public_key().to_bytes().to_vec();
+        let community_id = tenant.community();
+
+        let expected_relay_url: RelayUrl =
+            crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &tenant)
+                .parse()
+                .expect("F5: expected NIP-42 relay URL");
+
+        let connection_finished = Arc::new(Notify::new());
+
+        let route_state = Arc::clone(&state);
+        let route_tenant = tenant.clone();
+        let route_finished = Arc::clone(&connection_finished);
+        let assertion_c = assertion.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("F5: bind test listener");
+        let addr = listener.local_addr().expect("F5: listener addr");
+
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/",
+                get(move |ws: WebSocketUpgrade| {
+                    let state = Arc::clone(&route_state);
+                    let tenant = route_tenant.clone();
+                    let finished = Arc::clone(&route_finished);
+                    let assertion = assertion_c.clone();
+                    async move {
+                        ws.on_upgrade(move |socket| async move {
+                            let cancel = CancellationToken::new();
+                            let control = CommunityConnectionControl::new(cancel);
+                            handle_active_connection(
+                                socket,
+                                state,
+                                "127.0.0.1:1234".parse().expect("client addr"),
+                                tenant,
+                                Uuid::new_v4(),
+                                control,
+                                Some(assertion),
+                                chrono::Utc::now(),
+                            )
+                            .await;
+                            finished.notify_one();
+                        })
+                    }
+                }),
+            );
+            axum::serve(listener, app)
+                .await
+                .expect("F5: serve lifecycle WS");
+        });
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("F5: connect client");
+
+        // ── NIP-42 auth exchange ──────────────────────────────────────────
+        let challenge_frame =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+                .await
+                .expect("F5: challenge timeout")
+                .expect("F5: challenge item")
+                .expect("F5: challenge message");
+        let challenge_text = match challenge_frame {
+            Message::Text(t) => t.to_string(),
+            other => panic!("F5: expected text challenge; got {other:?}"),
+        };
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&challenge_text).expect("F5: challenge JSON");
+        assert_eq!(challenge_json[0], "AUTH", "F5: expected AUTH message");
+        let challenge = challenge_json[1].as_str().expect("F5: challenge field");
+
+        let auth_event = EventBuilder::auth(challenge, expected_relay_url)
+            .sign_with_keys(&member_keys)
+            .expect("F5: sign NIP-42 AUTH");
+        client
+            .send(Message::Text(
+                serde_json::json!(["AUTH", auth_event]).to_string().into(),
+            ))
+            .await
+            .expect("F5: send auth");
+
+        // Drain OK message and any following messages until connection confirms
+        // auth (OK ["AUTH", ...] message). Allow up to 3s for auth.
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let frame = client
+                    .next()
+                    .await
+                    .expect("F5: auth response item")
+                    .expect("F5: auth response message");
+                if let Message::Text(t) = &frame {
+                    let v: serde_json::Value = serde_json::from_str(t).unwrap_or_default();
+                    if v[0] == "OK" {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("F5: auth OK timeout");
+
+        // ── Arm the post-acquire hook, then send REQ ──────────────────────
+        let (arrived_rx, hook_release) =
+            crate::nip_fi_test_hooks::req_permit_acquired_hook::arm(community_id);
+
+        client
+            .send(Message::Text(
+                serde_json::json!(["REQ", "sub1", {}]).to_string().into(),
+            ))
+            .await
+            .expect("F5: send REQ");
+
+        // Wait for REQ to reach the post-acquire hook (permit is now held).
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("F5: REQ must reach after_req_permit_acquired within 5s                      (permit held, subscription not yet registered)")
+            .expect("F5: hook arrived channel closed");
+
+        // ── Admin disconnect: real production path ────────────────────────
+        let closed = state.conn_manager.disconnect_nip_fi(&pubkey_bytes);
+        assert_eq!(
+            closed, 1,
+            "F5: conn_manager.disconnect_nip_fi must find exactly 1 connection"
+        );
+
+        // ── Release hook → REQ proceeds → registers sub + retains topic ──
+        hook_release.notify_one();
+
+        // Wait for the full connection teardown (recv_loop exits + epilogue runs).
+        // Bounded: if teardown hangs (e.g., quiescence deadlocks), this panics.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connection_finished.notified(),
+        )
+        .await
+        .expect("F5: connection must finish within 10s after hook release                  (proves epilogue ran: sub_registry.remove_connection + release_topic)");
+
+        // ── Assert zero orphan subscriptions ─────────────────────────────
+        assert_eq!(
+            state.sub_registry.total_subscriptions(),
+            0,
+            "F5: sub_registry must have zero subscriptions after connection teardown.              Mutation B: remove sub_registry.remove_connection from epilogue → stays 1 → fails."
+        );
+
+        // ── Assert zero topic refcounts ───────────────────────────────────
+        let refcount = state
+            .pubsub
+            .topic_refcount(&tenant, EventTopic::Global)
+            .await;
+        assert_eq!(
+            refcount, 0,
+            "F5: global topic refcount must be zero after connection teardown.              Mutation C: remove pubsub.release_topic from epilogue → stays 1 → fails."
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
 }

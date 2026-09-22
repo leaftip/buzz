@@ -310,6 +310,13 @@ pub async fn handle_req(
             return;
         }
     };
+    // Test hook: fires after permit is acquired (held) but before sub_registry
+    // registration.  Used by F5 loopback teardown witness: admin disconnect fires
+    // here (permit still held → quiescence blocks expiry task) then the hook
+    // releases → handler registers subscription → connection epilogue removes it.
+    // No-op in production.  [nip_fi_test_hooks::req_permit_acquired_hook, F5]
+    #[cfg(test)]
+    crate::nip_fi_test_hooks::after_req_permit_acquired(conn.tenant.community()).await;
 
     {
         let mut subs = conn.subscriptions.lock().await;

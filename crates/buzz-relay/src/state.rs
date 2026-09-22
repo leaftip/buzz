@@ -4810,7 +4810,16 @@ pub(crate) mod tests {
             }),
         );
 
-        // Consumer: busy-waits for the first cancel signal, then drains.
+        // Completion channels: each thread sends () when done so main can
+        // bound the join with recv_timeout rather than blocking indefinitely.
+        // This ensures a broken cancellation path or panicking thread produces
+        // a bounded test failure rather than a silent hang.  [F7: bounded completion]
+        let (consumer_done_tx, consumer_done_rx) = std::sync::mpsc::channel::<()>();
+        let (manager_done_tx, manager_done_rx) = std::sync::mpsc::channel::<()>();
+        let (lc_done_tx, lc_done_rx) = std::sync::mpsc::channel::<()>();
+
+        // Consumer: waits for the first cancel signal (1ms sleep to avoid a
+        // CPU-hot busy-spin), then drains.
         let cancel_for_consumer = cancel.clone();
         let consumer_result: Arc<std::sync::Mutex<Option<Result<WsMessage, _>>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -4818,10 +4827,11 @@ pub(crate) mod tests {
         let mut terminal_rx_for_consumer = terminal_rx;
         let consumer_thread = std::thread::spawn(move || {
             while !cancel_for_consumer.is_cancelled() {
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             let r = terminal_rx_for_consumer.try_recv();
             *consumer_result_for_thread.lock().unwrap() = Some(r);
+            let _ = consumer_done_tx.send(());
         });
 
         // Manager thread: wins reason, fires hook (pauses), try_send, drops lock,
@@ -4830,6 +4840,7 @@ pub(crate) mod tests {
         let terminal_tx_for_manager = terminal_tx;
         let manager_thread = std::thread::spawn(move || {
             control_for_manager.manager_disconnect_nip_fi(&terminal_tx_for_manager);
+            let _ = manager_done_tx.send(());
         });
 
         // Wait for manager to reach the hook (won reason, lock held).
@@ -4857,6 +4868,7 @@ pub(crate) mod tests {
             // MUTATION: lifecycle_cancel calls cancel.cancel() without the lock
             // — consumer wakes before manager's try_send, sees Err(Empty).
             control_for_lc.lifecycle_cancel();
+            let _ = lc_done_tx.send(());
         });
 
         // Wait for the lc_thread to enter lifecycle_cancel (observed via arrival
@@ -4875,6 +4887,16 @@ pub(crate) mod tests {
         // then drops the lock so lifecycle_cancel can acquire it).
         hook_proceed_tx.send(()).unwrap();
 
+        // Bounded completion: 5-second deadline per thread.  A failure here means
+        // a thread is hung — the disarm below ensures the hook is cleared.
+        lc_done_rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("W_lifecycle_cancel_race: lifecycle_cancel thread must complete within 5s [F7: bounded completion]");
+        manager_done_rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("W_lifecycle_cancel_race: manager thread must complete within 5s [F7: bounded completion]");
+        consumer_done_rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("W_lifecycle_cancel_race: consumer thread must complete within 5s [F7: bounded completion]");
+
+        // Join handles to surface panics; they have completed above so join is instant.
         lc_thread
             .join()
             .expect("W_lifecycle_cancel_race: lifecycle_cancel thread panicked");
@@ -4885,6 +4907,7 @@ pub(crate) mod tests {
             .join()
             .expect("W_lifecycle_cancel_race: consumer thread panicked");
 
+        // Disarm after completion — must run even if joins above panic.
         manager_race_test_hook::disarm(hook_key);
 
         let consumer_saw = consumer_result
@@ -4986,6 +5009,10 @@ pub(crate) mod tests {
             }),
         );
 
+        let (consumer_done_tx, consumer_done_rx) = std::sync::mpsc::channel::<()>();
+        let (deny_done_tx, deny_done_rx) = std::sync::mpsc::channel::<()>();
+        let (drain_done_tx, drain_done_rx) = std::sync::mpsc::channel::<()>();
+
         let cancel_for_consumer = cancel.clone();
         let consumer_result: Arc<std::sync::Mutex<Option<Result<WsMessage, _>>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -4993,10 +5020,11 @@ pub(crate) mod tests {
         let mut terminal_rx_for_consumer = terminal_ctrl_rx;
         let consumer_thread = std::thread::spawn(move || {
             while !cancel_for_consumer.is_cancelled() {
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             let r = terminal_rx_for_consumer.try_recv();
             *consumer_result_for_thread.lock().unwrap() = Some(r);
+            let _ = consumer_done_tx.send(());
         });
 
         // Deny thread: real production path through ConnectionManager.
@@ -5004,6 +5032,7 @@ pub(crate) mod tests {
         let pubkey_for_deny = pubkey.clone();
         let deny_thread = std::thread::spawn(move || {
             mgr_for_deny.disconnect_nip_fi(&pubkey_for_deny);
+            let _ = deny_done_tx.send(());
         });
 
         // Wait for deny to reach the hook (won reason, lock held).
@@ -5031,6 +5060,7 @@ pub(crate) mod tests {
             // MUTATION: lifecycle_cancel calls cancel.cancel() bare → fires
             // before deny's try_send → consumer wakes on empty terminal channel.
             mgr_for_drain.drain_all();
+            let _ = drain_done_tx.send(());
         });
 
         // Wait for the drain_thread to enter lifecycle_cancel (observed via
@@ -5048,6 +5078,13 @@ pub(crate) mod tests {
         // Allow the hook to proceed (deny's try_send can now complete, then
         // drops the lock so drain_all's lifecycle_cancel can acquire it).
         hook_proceed_tx.send(()).unwrap();
+
+        drain_done_rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("W_root_manager_drain_race: drain_all thread must complete within 5s [F7: bounded completion]");
+        deny_done_rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("W_root_manager_drain_race: deny thread must complete within 5s [F7: bounded completion]");
+        consumer_done_rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("W_root_manager_drain_race: consumer thread must complete within 5s [F7: bounded completion]");
 
         drain_thread
             .join()
@@ -5148,6 +5185,10 @@ pub(crate) mod tests {
             }),
         );
 
+        let (consumer_done_tx, consumer_done_rx) = std::sync::mpsc::channel::<()>();
+        let (deny_done_tx, deny_done_rx) = std::sync::mpsc::channel::<()>();
+        let (lc_done_tx, lc_done_rx) = std::sync::mpsc::channel::<()>();
+
         // Consumer: wakes on first cancel, immediately drains terminal channel.
         let cancel_for_consumer = cancel.clone();
         let consumer_result: Arc<std::sync::Mutex<Option<Result<WsMessage, _>>>> =
@@ -5156,10 +5197,11 @@ pub(crate) mod tests {
         let mut terminal_rx_for_consumer = terminal_rx;
         let consumer_thread = std::thread::spawn(move || {
             while !cancel_for_consumer.is_cancelled() {
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             let r = terminal_rx_for_consumer.try_recv();
             *consumer_result_for_thread.lock().unwrap() = Some(r);
+            let _ = consumer_done_tx.send(());
         });
 
         // Deny thread: real audio registry path.
@@ -5168,6 +5210,7 @@ pub(crate) mod tests {
             let target_pubkey = target_pubkey.clone();
             move || {
                 registry.disconnect_nip_fi(&target_pubkey);
+                let _ = deny_done_tx.send(());
             }
         });
 
@@ -5196,6 +5239,7 @@ pub(crate) mod tests {
             // teardown fires cancel before deny's try_send → consumer sees
             // Err(Empty) → RED.
             control_for_lc.lifecycle_cancel();
+            let _ = lc_done_tx.send(());
         });
 
         // Wait for the lc_thread to enter lifecycle_cancel (observed via
@@ -5213,6 +5257,13 @@ pub(crate) mod tests {
         // Allow the hook to proceed (deny's try_send can now complete, then
         // drops the lock so lifecycle_cancel can acquire it).
         hook_proceed_tx.send(()).unwrap();
+
+        lc_done_rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("W_audio_registry_lifecycle_cancel_race: lc_thread must complete within 5s [F7: bounded completion]");
+        deny_done_rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("W_audio_registry_lifecycle_cancel_race: deny thread must complete within 5s [F7: bounded completion]");
+        consumer_done_rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("W_audio_registry_lifecycle_cancel_race: consumer thread must complete within 5s [F7: bounded completion]");
 
         lc_thread
             .join()
