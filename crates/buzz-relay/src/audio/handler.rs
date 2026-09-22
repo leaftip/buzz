@@ -6962,7 +6962,6 @@ mod tests {
         async fn f7a_joined_payload_includes_joining_peer() {
             use chrono::{Duration, Utc};
             use std::sync::Arc;
-            use uuid::Uuid;
 
             let state = audio_test_state_real_db()
                 .await
@@ -6994,8 +6993,23 @@ mod tests {
                     .expect("F7a: add alice");
             room.mark_committed(alice_id);
 
-            // Now commit bob's join via commit_participant_join.
-            let bob_peer_id = Uuid::new_v4();
+            // Add bob to the room first (mirrors the production path where
+            // add_peer runs before commit_participant_join). The peer_id
+            // returned by add_peer is the UUID that mark_committed inside
+            // commit_participant_join must target — a fresh Uuid::new_v4()
+            // here would mark a nonexistent entry and leave bob pending in
+            // the snapshot.
+            let (
+                bob_peer_id,
+                bob_peer_index,
+                bob_peer_epoch,
+                _bob_audio_rx,
+                _bob_ctrl_rx,
+                _bob_rev,
+            ) = room
+                .add_peer(bob_hex.clone(), 2)
+                .expect("F7a: add bob to room");
+
             let deadline = Utc::now() + Duration::hours(1);
             let cancel = tokio_util::sync::CancellationToken::new();
             let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel);
@@ -7008,8 +7022,8 @@ mod tests {
                 &bob_hex,
                 &bob_bytes,
                 bob_peer_id,
-                1u8,
-                0u8,
+                bob_peer_index,
+                bob_peer_epoch,
                 1,
                 "1",
                 &MembershipAdmission::Existing {
