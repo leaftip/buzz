@@ -1,0 +1,15 @@
+# Pairing sidecar for mobile (upstream block/buzz #7721: the official bundle never starts it).
+# The image's ENTRYPOINT is buzz-relay, so this service overrides `entrypoint`, not `command`.
+# The relay advertises the sidecar in NIP-11 through BUZZ_PAIRING_RELAY_URL in .env.
+services:
+  pair-relay:
+    image: ${BUZZ_IMAGE:-ghcr.io/block/buzz:main}
+    entrypoint: ["/usr/local/bin/buzz-pair-relay"]
+    environment:
+      BUZZ_PAIR_RELAY_BIND_ADDR: 0.0.0.0:5000
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "${BUZZ_PAIR_PORT:-3001}:5000"
+    restart: unless-stopped
+    networks:
+      - buzz-net

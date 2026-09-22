@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 COMPOSE_FILES=(-f compose.yml)
+# Leaftip: the pairing sidecar overlay (upstream #7721), included when present.
+if [[ -f compose.pairing.yml ]]; then
+  COMPOSE_FILES+=(-f compose.pairing.yml)
+fi
 if [[ "${BUZZ_COMPOSE_TLS:-false}" == "true" ]]; then
   COMPOSE_FILES+=(-f compose.caddy.yml)
 fi
