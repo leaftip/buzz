@@ -4789,6 +4789,18 @@ pub(crate) mod tests {
         // Capture per-control key for scoped hook. [F7]
         let hook_key = control.hook_key;
 
+        // Drop guard: disarms the hook on test exit regardless of panic or
+        // early return.  Without this, a panic between arm() and the plain
+        // disarm() call below leaves the global hook slot occupied, which
+        // can cause interference in subsequent test runs.  [F7: failure-path cleanup]
+        struct HookDisarm(uuid::Uuid);
+        impl Drop for HookDisarm {
+            fn drop(&mut self) {
+                manager_race_test_hook::disarm(self.0);
+            }
+        }
+        let _hook_guard = HookDisarm(hook_key);
+
         let (hook_ready_tx, hook_ready_rx) = std::sync::mpsc::channel::<()>();
         let (hook_proceed_tx, hook_proceed_rx_inner) = std::sync::mpsc::channel::<()>();
         let hook_proceed_rx = std::sync::Arc::new(std::sync::Mutex::new(hook_proceed_rx_inner));
@@ -4907,7 +4919,8 @@ pub(crate) mod tests {
             .join()
             .expect("W_lifecycle_cancel_race: consumer thread panicked");
 
-        // Disarm after completion — must run even if joins above panic.
+        // Explicit disarm: _hook_guard's Drop impl also disarms but this
+        // keeps the intent visible here.  Redundant, not harmful.
         manager_race_test_hook::disarm(hook_key);
 
         let consumer_saw = consumer_result
@@ -4974,6 +4987,17 @@ pub(crate) mod tests {
         let control = CommunityConnectionControl::new(cancel.clone());
         // Capture per-control key for scoped hook before moving control into register(). [F7]
         let hook_key = control.hook_key;
+
+        // Drop guard: disarms the hook on test exit regardless of panic or
+        // early return.  [F7: failure-path cleanup]
+        struct HookDisarmMgr(uuid::Uuid);
+        impl Drop for HookDisarmMgr {
+            fn drop(&mut self) {
+                manager_race_test_hook::disarm(self.0);
+            }
+        }
+        let _hook_guard = HookDisarmMgr(hook_key);
+
         // Root connections use terminal_ctrl_tx passed to register(), not
         // control.terminal_frame_tx (which is the audio-path slot).  No
         // set_terminal_frame_sender call needed here.
@@ -5096,6 +5120,8 @@ pub(crate) mod tests {
             .join()
             .expect("W_root_manager_drain_race: consumer thread panicked");
 
+        // Explicit disarm: _hook_guard's Drop impl also disarms but this
+        // keeps the intent visible here.  Redundant, not harmful.
         manager_race_test_hook::disarm(hook_key);
 
         let consumer_saw = consumer_result
@@ -5169,6 +5195,17 @@ pub(crate) mod tests {
         let _guard = registry.register(Uuid::new_v4(), community, control.clone());
 
         let hook_key = control.hook_key;
+
+        // Drop guard: disarms the hook on test exit regardless of panic or
+        // early return.  [F7: failure-path cleanup]
+        struct HookDisarmCancel(uuid::Uuid);
+        impl Drop for HookDisarmCancel {
+            fn drop(&mut self) {
+                cancel_race_test_hook::disarm(self.0);
+            }
+        }
+        let _hook_guard = HookDisarmCancel(hook_key);
+
         let (hook_ready_tx, hook_ready_rx) = std::sync::mpsc::channel::<()>();
         let (hook_proceed_tx, hook_proceed_rx_inner) = std::sync::mpsc::channel::<()>();
         let hook_proceed_rx = std::sync::Arc::new(std::sync::Mutex::new(hook_proceed_rx_inner));
@@ -5275,6 +5312,8 @@ pub(crate) mod tests {
             .join()
             .expect("W_audio_registry_lifecycle_cancel_race: consumer thread panicked");
 
+        // Explicit disarm: _hook_guard's Drop impl also disarms but this
+        // keeps the intent visible here.  Redundant, not harmful.
         cancel_race_test_hook::disarm(hook_key);
 
         let consumer_saw = consumer_result

@@ -376,23 +376,31 @@ pub(crate) async fn handle_active_audio_connection(
                         "NIP-FI deny-set hit at audio post-registration check — denying"
                     );
                     use futures_util::SinkExt as _;
-                    let _ = ws_send
-                        .send(crate::nip_fi_session::authorization_denied_frame(
+                    // Bounded sends: pre-writer exits must not block on a stalled
+                    // sink indefinitely. [R2: bounded delivery — consistent policy]
+                    let _deny_deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                    let _ = tokio::time::timeout_at(
+                        _deny_deadline,
+                        ws_send.send(crate::nip_fi_session::authorization_denied_frame(
                             crate::nip_fi_session::NipFiWsRoute::Audio,
-                        ))
-                        .await;
+                        )),
+                    )
+                    .await;
                     // Send explicit 1008 POLICY close frame; send_loop not yet
                     // started so ws_send is directly owned. [FI-TRACE-CLOSE-CODE]
-                    let _ = ws_send
-                        .send(axum::extract::ws::Message::Close(Some(
+                    let _ = tokio::time::timeout_at(
+                        _deny_deadline,
+                        ws_send.send(axum::extract::ws::Message::Close(Some(
                             axum::extract::ws::CloseFrame {
                                 code: axum::extract::ws::close_code::POLICY,
                                 reason: axum::extract::ws::Utf8Bytes::from_static(
                                     "authorization denied",
                                 ),
                             },
-                        )))
-                        .await;
+                        ))),
+                    )
+                    .await;
                     cancel.cancel();
                     return;
                 }
@@ -463,21 +471,28 @@ pub(crate) async fn handle_active_audio_connection(
                 "NIP-FI session deadline already expired at pairing — rejecting audio admission"
             );
             use futures_util::SinkExt as _;
-            let _ = ws_send
-                .send(crate::nip_fi_session::authorization_denied_frame(
+            // Bounded sends: pre-writer exits must not block on a stalled
+            // sink indefinitely. [R2: bounded delivery — consistent policy]
+            let _expired_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+            let _ = tokio::time::timeout_at(
+                _expired_deadline,
+                ws_send.send(crate::nip_fi_session::authorization_denied_frame(
                     crate::nip_fi_session::NipFiWsRoute::Audio,
-                ))
-                .await;
+                )),
+            )
+            .await;
             // Send explicit 1008 POLICY close frame; send_loop not yet
             // started so ws_send is directly owned. [FI-TRACE-CLOSE-CODE]
-            let _ = ws_send
-                .send(axum::extract::ws::Message::Close(Some(
+            let _ = tokio::time::timeout_at(
+                _expired_deadline,
+                ws_send.send(axum::extract::ws::Message::Close(Some(
                     axum::extract::ws::CloseFrame {
                         code: axum::extract::ws::close_code::POLICY,
                         reason: axum::extract::ws::Utf8Bytes::from_static("authorization denied"),
                     },
-                )))
-                .await;
+                ))),
+            )
+            .await;
             cancel.cancel();
             return;
         }
@@ -492,15 +507,20 @@ pub(crate) async fn handle_active_audio_connection(
         () => {
             if cancel.is_cancelled() {
                 use futures_util::SinkExt as _;
+                // Bounded sends: pre-writer exits must not block on a stalled
+                // sink indefinitely. [R2: bounded delivery — consistent policy]
+                let _cc_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
                 while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                    let _ = ws_send.send(msg).await;
+                    let _ = tokio::time::timeout_at(_cc_deadline, ws_send.send(msg)).await;
                 }
                 // Emit the policy close frame when a NIP-FI reason is set.
                 // The send_loop is not yet started so ws_send is directly
                 // owned here. [FI-TRACE-CLOSE-CODE, Fix-1]
                 let nip_fi_close_reason = *disconnect_reason.borrow();
                 if let Some(reason) = nip_fi_close_reason {
-                    let _ = ws_send.send(reason.close_message()).await;
+                    let _ =
+                        tokio::time::timeout_at(_cc_deadline, ws_send.send(reason.close_message()))
+                            .await;
                 }
                 return;
             }
@@ -509,14 +529,19 @@ pub(crate) async fn handle_active_audio_connection(
             if cancel.is_cancelled() {
                 $cleanup;
                 use futures_util::SinkExt as _;
+                // Bounded sends: pre-writer exits must not block on a stalled
+                // sink indefinitely. [R2: bounded delivery — consistent policy]
+                let _cc_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
                 while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                    let _ = ws_send.send(msg).await;
+                    let _ = tokio::time::timeout_at(_cc_deadline, ws_send.send(msg)).await;
                 }
                 // Emit the policy close frame when a NIP-FI reason is set.
                 // [FI-TRACE-CLOSE-CODE, Fix-1]
                 let nip_fi_close_reason = *disconnect_reason.borrow();
                 if let Some(reason) = nip_fi_close_reason {
-                    let _ = ws_send.send(reason.close_message()).await;
+                    let _ =
+                        tokio::time::timeout_at(_cc_deadline, ws_send.send(reason.close_message()))
+                            .await;
                 }
                 return;
             }
@@ -535,14 +560,19 @@ pub(crate) async fn handle_active_audio_connection(
                     }
                 }
                 use futures_util::SinkExt as _;
+                // Bounded sends: pre-writer exits must not block on a stalled
+                // sink indefinitely. [R2: bounded delivery — consistent policy]
+                let _cc_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
                 while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                    let _ = ws_send.send(msg).await;
+                    let _ = tokio::time::timeout_at(_cc_deadline, ws_send.send(msg)).await;
                 }
                 // Emit the policy close frame when a NIP-FI reason is set.
                 // [FI-TRACE-CLOSE-CODE, Fix-1]
                 let nip_fi_close_reason = *disconnect_reason.borrow();
                 if let Some(reason) = nip_fi_close_reason {
-                    let _ = ws_send.send(reason.close_message()).await;
+                    let _ =
+                        tokio::time::timeout_at(_cc_deadline, ws_send.send(reason.close_message()))
+                            .await;
                 }
                 return;
             }
