@@ -362,7 +362,7 @@ mod tests {
         use nostr::Keys;
         use std::collections::HashMap;
         use std::sync::Arc;
-        use tokio::sync::{mpsc, RwLock};
+        use tokio::sync::mpsc;
         use tokio_util::sync::CancellationToken;
         use uuid::Uuid;
 
@@ -383,7 +383,7 @@ mod tests {
             conn_id: Uuid::new_v4(),
             tenant: buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string()),
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
-            auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
+            auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated(
                 buzz_auth::AuthContext {
                     pubkey: keys.public_key(),
                     scopes: vec![],

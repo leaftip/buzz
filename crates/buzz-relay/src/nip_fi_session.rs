@@ -258,7 +258,7 @@ mod tests {
     use chrono::Utc;
     use nostr::Keys;
     use std::sync::Arc;
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
@@ -308,8 +308,9 @@ mod tests {
                 "test.local".to_string(),
             ),
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
-            auth_state: RwLock::new(crate::connection::AuthState::Pending {
+            auth_state: std::sync::Mutex::new(crate::connection::AuthState::Pending {
                 challenge: "test-challenge".to_string(),
+                started_at: std::time::Instant::now(),
             }),
             subscriptions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             send_tx,

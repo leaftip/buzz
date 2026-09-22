@@ -1387,10 +1387,7 @@ impl Config {
                 "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
             push_enabled: false,
             push_executor_key_id: "relay-v1".to_string(),
-            push_gateway_delivery_url: Some(
-                parse_push_gateway_delivery_url(DEFAULT_PUSH_GATEWAY_DELIVERY_URL)
-                    .expect("static default URL parses"),
-            ),
+            push_gateway_delivery_url: None,
             push_gateway_timeout: std::time::Duration::from_millis(2_000),
             join_policy: None,
             admin: None,

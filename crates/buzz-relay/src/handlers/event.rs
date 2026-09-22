@@ -1595,6 +1595,8 @@ mod tests {
             let keys = Keys::generate();
             let (send_tx, mut send_rx) = mpsc::channel(10);
             let (ctrl_tx, _ctrl_rx) = mpsc::channel(10);
+            let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel(1);
+            let cancel = CancellationToken::new();
             let conn = Arc::new(crate::connection::ConnectionState {
                 conn_id: Uuid::new_v4(),
                 tenant: tenant.clone(),
@@ -1611,23 +1613,34 @@ mod tests {
                 subscriptions: Arc::new(Mutex::new(HashMap::new())),
                 send_tx,
                 ctrl_tx,
-                cancel: CancellationToken::new(),
+                terminal_ctrl_tx,
+                cancel: cancel.clone(),
                 backpressure_count: Arc::new(AtomicU8::new(0)),
                 grace_limit: 3,
+                nip_fi_assertion: None,
+                session_deadline: None,
+                nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+                community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
             });
             let watcher = Uuid::new_v4();
             let (tx, mut rx) = mpsc::channel(10);
             let (ctrl, _ctrl_rx) = mpsc::channel(10);
+            let (terminal_ctrl, _terminal_ctrl_rx2) = mpsc::channel(1);
+            let watcher_cancel = CancellationToken::new();
+            let watcher_control =
+                crate::state::CommunityConnectionControl::new(watcher_cancel.clone());
             state.conn_manager.register(
                 watcher,
                 tx,
                 ctrl,
+                terminal_ctrl,
                 None,
-                CancellationToken::new(),
+                watcher_cancel,
                 tenant.community(),
                 Arc::new(AtomicU8::new(0)),
                 Arc::new(Mutex::new(HashMap::new())),
                 3,
+                watcher_control,
             );
             state.sub_registry.register_scoped(
                 tenant.community(),
@@ -1740,6 +1753,8 @@ mod tests {
             let keys = Keys::generate();
             let (send_tx, mut send_rx) = mpsc::channel(10);
             let (ctrl_tx, _ctrl_rx) = mpsc::channel(10);
+            let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel(1);
+            let cancel = CancellationToken::new();
             let conn = Arc::new(crate::connection::ConnectionState {
                 conn_id: Uuid::new_v4(),
                 tenant: tenant.clone(),
@@ -1756,9 +1771,14 @@ mod tests {
                 subscriptions: Arc::new(Mutex::new(HashMap::new())),
                 send_tx,
                 ctrl_tx,
-                cancel: CancellationToken::new(),
+                terminal_ctrl_tx,
+                cancel: cancel.clone(),
                 backpressure_count: Arc::new(AtomicU8::new(0)),
                 grace_limit: 3,
+                nip_fi_assertion: None,
+                session_deadline: None,
+                nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+                community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
             });
             // Same watcher registration as the ACK/fan-out cases, proving
             // the storage failure still reaches no subscriber while its
@@ -1766,16 +1786,22 @@ mod tests {
             let watcher = Uuid::new_v4();
             let (tx, mut rx) = mpsc::channel(10);
             let (ctrl, _ctrl_rx) = mpsc::channel(10);
+            let (terminal_ctrl2, _terminal_ctrl_rx2) = mpsc::channel(1);
+            let watcher_cancel = CancellationToken::new();
+            let watcher_control =
+                crate::state::CommunityConnectionControl::new(watcher_cancel.clone());
             state.conn_manager.register(
                 watcher,
                 tx,
                 ctrl,
+                terminal_ctrl2,
                 None,
-                CancellationToken::new(),
+                watcher_cancel,
                 tenant.community(),
                 Arc::new(AtomicU8::new(0)),
                 Arc::new(Mutex::new(HashMap::new())),
                 3,
+                watcher_control,
             );
             state.sub_registry.register_scoped(
                 tenant.community(),
@@ -3000,7 +3026,7 @@ mod tests {
             use std::collections::HashMap;
             use std::sync::atomic::Ordering;
             use std::sync::Arc;
-            use tokio::sync::{mpsc, RwLock};
+            use tokio::sync::mpsc;
             use tokio_util::sync::CancellationToken;
             use uuid::Uuid;
 
@@ -3024,7 +3050,7 @@ mod tests {
                     "test.local".to_string(),
                 ),
                 remote_addr: "127.0.0.1:1234".parse().unwrap(),
-                auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
+                auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated(
                     buzz_auth::AuthContext {
                         pubkey: key.public_key(),
                         scopes: vec![],
@@ -3180,7 +3206,7 @@ mod tests {
         };
         use nostr::{EventBuilder, Keys, Kind, Tag};
         use std::sync::Arc;
-        use tokio::sync::{mpsc, RwLock};
+        use tokio::sync::mpsc;
         use tokio_util::sync::CancellationToken;
         use uuid::Uuid;
 
@@ -3207,7 +3233,7 @@ mod tests {
             conn_id: Uuid::new_v4(),
             tenant: buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string()),
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
-            auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
+            auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated(
                 buzz_auth::AuthContext {
                     pubkey: owner_pubkey,
                     scopes: vec![],

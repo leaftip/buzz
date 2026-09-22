@@ -7454,16 +7454,21 @@ mod postgres_tests {
         let conn_id = uuid::Uuid::new_v4();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let reg_cancel = tokio_util::sync::CancellationToken::new();
+        let reg_control = crate::state::CommunityConnectionControl::new(reg_cancel.clone());
         state.conn_manager.register(
             conn_id,
             tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             None,
-            tokio_util::sync::CancellationToken::new(),
+            reg_cancel,
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            reg_control,
         );
         state
             .conn_manager
@@ -9142,16 +9147,21 @@ mod postgres_tests {
         let conn_id = uuid::Uuid::new_v4();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let reg_cancel = tokio_util::sync::CancellationToken::new();
+        let reg_control = crate::state::CommunityConnectionControl::new(reg_cancel.clone());
         state.conn_manager.register(
             conn_id,
             tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             None,
-            tokio_util::sync::CancellationToken::new(),
+            reg_cancel,
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            reg_control,
         );
         state
             .conn_manager
@@ -9407,16 +9417,21 @@ mod postgres_tests {
         let conn_id = uuid::Uuid::new_v4();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let reg_cancel = tokio_util::sync::CancellationToken::new();
+        let reg_control = crate::state::CommunityConnectionControl::new(reg_cancel.clone());
         state.conn_manager.register(
             conn_id,
             tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             None,
-            tokio_util::sync::CancellationToken::new(),
+            reg_cancel,
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            reg_control,
         );
         state
             .conn_manager
@@ -10282,16 +10297,21 @@ mod postgres_tests {
         let conn_id = uuid::Uuid::new_v4();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let reg_cancel = tokio_util::sync::CancellationToken::new();
+        let reg_control = crate::state::CommunityConnectionControl::new(reg_cancel.clone());
         state.conn_manager.register(
             conn_id,
             tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             None,
-            tokio_util::sync::CancellationToken::new(),
+            reg_cancel,
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            reg_control,
         );
         state
             .conn_manager
@@ -10542,16 +10562,21 @@ mod postgres_tests {
         let conn_id = uuid::Uuid::new_v4();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let reg_cancel = tokio_util::sync::CancellationToken::new();
+        let reg_control = crate::state::CommunityConnectionControl::new(reg_cancel.clone());
         state.conn_manager.register(
             conn_id,
             tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             None,
-            tokio_util::sync::CancellationToken::new(),
+            reg_cancel,
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            reg_control,
         );
         state
             .conn_manager
@@ -10740,16 +10765,21 @@ mod postgres_tests {
         let conn_id = uuid::Uuid::new_v4();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let reg_cancel = tokio_util::sync::CancellationToken::new();
+        let reg_control = crate::state::CommunityConnectionControl::new(reg_cancel.clone());
         state.conn_manager.register(
             conn_id,
             tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             None,
-            tokio_util::sync::CancellationToken::new(),
+            reg_cancel,
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            reg_control,
         );
         state
             .conn_manager
