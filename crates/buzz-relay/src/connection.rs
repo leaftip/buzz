@@ -2625,22 +2625,27 @@ pub(crate) mod tests {
         );
     }
 
-    // ── R1: denial wins over concurrent restart — writer delivers denial close
-    //        rather than 1012 and signals restart.flushed=false ────────────────
+    // ── R1 witnesses: denial wins over concurrent restart. ───────────────────
     //
-    // Schedule: denial already queued on terminal_ctrl_rx, restart command
-    // queued on restart_rx.  Biased select fires the restart arm first.
-    // Without the R1 fix, the restart arm sends 1012 and breaks without reading
-    // terminal_ctrl_rx, discarding the winning denial frame.
-    // With the R1 fix, the restart arm checks terminal_ctrl_rx first; if a
-    // denial frame is present it delivers the denial frame + denial close code
-    // and signals flushed=false.  The 1012 is not sent.
+    // Two complementary schedules that together prove the R1 fix:
     //
-    // Mutation evidence:
-    //   A) Remove the terminal_ctrl_rx.try_recv() check in the restart arm →
-    //      messages[0] becomes a 1012 instead of the denial frame → assertion panics.
-    //   B) Change `flushed.send(false)` to `flushed.send(true)` in the denial
-    //      branch → flushed_rx asserts false → assertion panics.
+    // 1. b3_denial_precedes_restart_when_denial_already_won (below):
+    //    Frame already on terminal_ctrl_rx when restart arm fires.  Reason is
+    //    set; recv() returns immediately with the existing frame.
+    //
+    // 2. r1_denial_precedes_restart_reason_won_frame_arrives_during_recv (below):
+    //    Reason set (AuthorizationDenied) but terminal_ctrl_rx is EMPTY when the
+    //    restart arm checks.  The arm calls bounded recv(); a concurrent task
+    //    enqueues the frame while recv() is waiting.  This covers the race window
+    //    documented at state.rs:295-310 where reason is published under the
+    //    transition lock before try_send.
+    //
+    // Mutation evidence (applies to both):
+    //   A) Remove the `disconnect_reason` watch check + recv() from the restart
+    //      arm → restarts always send 1012 even when denial won → first assertion
+    //      panics (denial frame missing or flushed=true).
+    //   B) Keep reason check but use try_recv() only (no bounded recv()) → race
+    //      schedule 2 returns Err(Empty) → 1012 sent instead of denial → panics.
 
     #[tokio::test]
     async fn b3_denial_precedes_restart_when_denial_already_won() {
@@ -2731,6 +2736,121 @@ pub(crate) mod tests {
                     "R1: last frame must be Close(Some(1008 POLICY)), got Close(None) — \
                      denial close code must be present when denial won the reason slot"
                 );
+            }
+            other => panic!("R1: last frame must be Close, got {other:?}"),
+        }
+    }
+
+    // ── R1 witness 2: reason won but frame not yet enqueued (recv path) ───────
+    //
+    // This schedule exercises the specific race documented at state.rs:295-310:
+    // `disconnect_reason` is set to AuthorizationDenied under the transition
+    // lock BEFORE `try_send` completes.  The restart arm may see the reason
+    // (AuthorizationDenied) but find terminal_ctrl_rx empty.  The R1 fix calls
+    // bounded `recv()` in this case; the frame arrives while recv() is waiting.
+    //
+    // Setup:
+    //   1. disconnect_reason set to AuthorizationDenied (reason won).
+    //   2. terminal_ctrl_rx is EMPTY — frame not yet enqueued.
+    //   3. restart command queued — biased select fires restart arm.
+    //   4. Concurrently (after send_loop_inner starts), enqueue the denial frame.
+    //
+    // Mutation evidence:
+    //   A) Replace recv() with try_recv() in the reason-won branch →
+    //      try_recv() returns Err(Empty) → 1012 sent → flushed=true →
+    //      flushed_rx assertion panics.
+    //   B) Remove the disconnect_reason check entirely → always try_recv() →
+    //      same result as A.
+    #[tokio::test]
+    async fn r1_denial_precedes_restart_reason_won_frame_arrives_during_recv() {
+        use crate::nip_fi_session::NipFiWsRoute;
+        use tokio::sync::mpsc;
+
+        let (_data_tx, data_rx) = mpsc::channel::<WsMessage>(16);
+        let (_ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
+        let (terminal_ctrl_tx, terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+        let (restart_tx, restart_rx) = mpsc::channel(1);
+        let (flushed_tx, flushed_rx) = tokio::sync::oneshot::channel::<bool>();
+        let cancel = CancellationToken::new();
+
+        // Set reason = AuthorizationDenied BUT do NOT enqueue the denial frame
+        // yet.  We simulate the window between reason publication and try_send:
+        // use a raw watch channel to publish the reason without going through
+        // the full CommunityConnectionControl path (which would also try_send).
+        let (reason_tx, reason_rx) =
+            tokio::sync::watch::channel(Some(CommunityDisconnectReason::AuthorizationDenied));
+        drop(reason_tx); // keep rx live; reason is already set
+
+        // Queue the restart command — the biased select will fire restart_rx.
+        restart_tx
+            .send(RestartClose {
+                flushed: flushed_tx,
+            })
+            .await
+            .expect("queue restart");
+
+        // Spawn a task that enqueues the denial frame after a brief yield,
+        // simulating try_send completing while the restart arm's recv() waits.
+        let denial = crate::nip_fi_session::authorization_denied_frame(NipFiWsRoute::Root);
+        let terminal_ctrl_tx_for_sender = terminal_ctrl_tx.clone();
+        let denial_for_sender = denial.clone();
+        tokio::spawn(async move {
+            // Yield to allow send_loop_inner to enter the restart arm and start
+            // its bounded recv() before the frame is available.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            terminal_ctrl_tx_for_sender
+                .send(denial_for_sender)
+                .await
+                .expect("enqueue denial frame during recv wait");
+        });
+
+        let (sink, state_arc) = MockSink::new(None);
+        send_loop_inner(
+            sink,
+            data_rx,
+            ctrl_rx,
+            terminal_ctrl_rx,
+            restart_rx,
+            cancel,
+            reason_rx,
+        )
+        .await;
+
+        // flushed must be false — denial won, restart 1012 not sent.
+        assert_eq!(
+            flushed_rx.await,
+            Ok(false),
+            "R1: restart.flushed must be false when denial reason is set \
+             (1012 must not be sent even when frame arrives during recv)"
+        );
+
+        let state = state_arc.lock().expect("mock sink poisoned");
+        let msgs = &state.messages;
+        assert!(
+            !msgs.is_empty(),
+            "R1: send_loop must write at least one frame when denial reason is set"
+        );
+        // First frame must be the denial TEXT frame, not 1012.
+        assert!(
+            matches!(msgs.first(), Some(WsMessage::Text(t)) if t.contains("authorization denied")),
+            "R1: first frame must be the denial frame, not 1012 — got {:?}. \
+             Mutation: use try_recv() instead of recv() → Err(Empty) → 1012 sent instead.",
+            msgs.first()
+        );
+        // Last frame must be Close(1008 POLICY).
+        let last = msgs.last().expect("at least one frame");
+        match last {
+            WsMessage::Close(Some(close)) => {
+                assert_eq!(
+                    close.code,
+                    axum::extract::ws::close_code::POLICY,
+                    "R1: close code must be 1008 POLICY when denial reason won; got {}",
+                    close.code
+                );
+            }
+            WsMessage::Close(None) => {
+                panic!("R1: last frame must be Close(Some(1008 POLICY)), got Close(None)");
             }
             other => panic!("R1: last frame must be Close, got {other:?}"),
         }

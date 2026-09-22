@@ -4804,6 +4804,14 @@ pub(crate) mod tests {
             control_for_lc.lifecycle_cancel();
         });
 
+        // Brief bounded pause to let the lc_thread enter the lock-acquisition
+        // path before the hook proceeds.  The hook still holds the lock here,
+        // so the thread will block on lock().  This establishes contention before
+        // release — without it the spawn might not have called lifecycle_cancel
+        // yet and the test would pass trivially (no contention).  [F7: bounded
+        // arrival coordination]
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
         // Allow the hook to proceed (manager's try_send can now complete,
         // then drops the lock so lifecycle_cancel can acquire it).
         hook_proceed_tx.send(()).unwrap();
@@ -4962,6 +4970,13 @@ pub(crate) mod tests {
             mgr_for_drain.drain_all();
         });
 
+        // Brief bounded pause to let the drain_thread enter lifecycle_cancel's
+        // lock-acquisition path before the hook proceeds.  The hook still holds
+        // the lock, so the thread will block.  Establishes contention before
+        // release — ensures the test exercises the blocking path rather than
+        // passing trivially with no contention.  [F7: bounded arrival coordination]
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
         // Allow the hook to proceed (deny's try_send can now complete, then
         // drops the lock so drain_all's lifecycle_cancel can acquire it).
         hook_proceed_tx.send(()).unwrap();
@@ -5110,6 +5125,13 @@ pub(crate) mod tests {
             // Err(Empty) → RED.
             control_for_lc.lifecycle_cancel();
         });
+
+        // Brief bounded pause to let the lc_thread enter the lock-acquisition
+        // path before the hook proceeds.  The hook still holds the lock, so
+        // the thread will block.  Establishes contention before release —
+        // ensures the test exercises the blocking path rather than passing
+        // trivially with no contention.  [F7: bounded arrival coordination]
+        std::thread::sleep(std::time::Duration::from_millis(5));
 
         // Allow the hook to proceed (deny's try_send can now complete, then
         // drops the lock so lifecycle_cancel can acquire it).

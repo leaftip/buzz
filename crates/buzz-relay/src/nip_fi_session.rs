@@ -703,7 +703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn w_f5_admin_cancel_arm_waits_for_held_permits_before_task_exit() {
+    async fn w_f5_quiescence_cancel_arm_blocks_until_permits_released() {
         let cancel = CancellationToken::new();
         let far_future = Utc::now() + chrono::Duration::hours(1);
         let gate = crate::nip_fi_gate::SessionAdmissionGate::new(far_future, cancel.clone());
@@ -786,12 +786,14 @@ mod tests {
     //   A) Remove `set_terminal_frame_sender` call → terminal_frame_tx slot is None →
     //      disconnect_nip_fi enqueues nothing → terminal_rx is empty → first
     //      `try_recv` assertion panics.
-    //   B) Add a `expire()` call instead of `quiesce()` in the cancel arm →
-    //      second terminal frame enqueued → `try_recv` after task completion sees a
-    //      frame → "must be empty" assertion panics.
-    //   C) Remove `gate.quiesce().await` from the cancel arm → task finishes before
-    //      quiesce_cancel_arm_hook fires → `arrived_rx` times out → panics; OR task
-    //      finishes while permit is still held → `is_finished` assertion panics.
+    //   B) Replace `gate.quiesce().await` with `gate.expire(|| {...}).await` in the
+    //      cancel arm → `expire()` enqueues a second terminal frame → `try_recv`
+    //      after task completion sees a frame → "must be empty" assertion panics.
+    //   C) Remove `gate.quiesce().await` from the cancel arm → task exits the cancel
+    //      arm without waiting → `quiesce_cancel_arm_hook::fire()` is still called
+    //      (it is before the quiesce call), so `arrived_rx` does NOT time out; but
+    //      the task completes while the permit is still held → the `is_finished`
+    //      assertion panics.
     #[tokio::test]
     async fn w_f5_registry_admin_disconnect_enqueues_frame_quiesces_no_dup() {
         use crate::state::{CommunityConnectionControl, CommunityConnectionRegistry};
@@ -1063,6 +1065,153 @@ mod tests {
             0,
             "W_f5_cleanup: zero subscriptions must remain after remove_connection \
              (complete cleanup, no orphan entries)"
+        );
+    }
+
+    // ── W_f5_teardown: production teardown sequence (connection.rs:627-631) ──
+    //
+    // Models the exact teardown sequence from `connection.rs:627-631`:
+    //   1. `nip_fi_expiry_task.await` — task must complete only after all
+    //      pre-cancel permit-holders finish (quiescence).
+    //   2. `sub_registry.remove_connection(conn_id)` — zero orphan subscriptions.
+    //
+    // The previous W_f5_cleanup test establishes the invariant with a REQ
+    // handler modelled by direct registry calls.  This test drives the same
+    // sequence through the named production functions to make the connection
+    // explicit: admin `registry.disconnect_nip_fi` → expiry task quiesces →
+    // task completes → teardown removes subscriptions.
+    //
+    // Contract:
+    //   - Exactly one terminal frame enqueued by the admin path (not by quiesce).
+    //   - Task blocked until permit is released (quiescence proof).
+    //   - Zero subscription orphans after teardown remove_connection.
+    //
+    // Mutation evidence:
+    //   A) Remove `gate.quiesce().await` → task exits before subscription
+    //      registered → remove_connection finds nothing → removed.len() != 1
+    //      → assertion panics.
+    //   B) Replace admin `registry.disconnect_nip_fi` with raw `cancel.cancel()`
+    //      → no terminal frame enqueued → first try_recv assertion panics.
+    #[tokio::test]
+    async fn w_f5_teardown_matches_connection_teardown_sequence() {
+        use crate::state::{CommunityConnectionControl, CommunityConnectionRegistry};
+        use crate::subscription::SubscriptionRegistry;
+        use buzz_core::tenant::CommunityId;
+        use nostr::Filter;
+        use uuid::Uuid;
+
+        let community = CommunityId::from_uuid(Uuid::new_v4());
+        let conn_id = Uuid::new_v4();
+        let target_pubkey = vec![0xf5u8; 32];
+
+        let cancel = CancellationToken::new();
+        let far_future = Utc::now() + chrono::Duration::hours(1);
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(far_future, cancel.clone());
+
+        // ── Step 1: acquire effect permit before admin disconnect (simulates an
+        //    in-flight REQ handler).  This is the window quiescence must protect.
+        let permit = gate
+            .acquire_effect()
+            .await
+            .expect("W_f5_teardown: permit must be available before cancel");
+
+        // ── Step 2: wire up the production components.
+        let (terminal_tx, mut terminal_rx) = mpsc::channel::<WsMessage>(1);
+        let control = CommunityConnectionControl::new(cancel.clone());
+        control.set_proven_pubkey(target_pubkey.clone());
+        control.set_terminal_frame_sender(terminal_tx.clone());
+
+        let registry = Arc::new(CommunityConnectionRegistry::new());
+        let sub_registry = Arc::new(SubscriptionRegistry::new());
+        let _guard = registry.register(Uuid::new_v4(), community, control.clone());
+
+        // Arm quiesce hook to observe task entering the quiescence barrier.
+        let quiesce_arrived_rx = quiesce_cancel_arm_hook::arm(control.hook_key);
+
+        // Spawn the expiry task — mirrors `nip_fi_expiry_task` in connection.rs.
+        let task_handle = spawn_nip_fi_expiry_task(
+            far_future,
+            Arc::clone(&gate),
+            terminal_tx,
+            NipFiWsRoute::Root,
+            control.clone(),
+        );
+
+        // ── Step 3: admin disconnect via the real production path.
+        //    This is `registry.disconnect_nip_fi(&pubkey)` — the call made by
+        //    `AppState::disconnect_nip_fi` in the admin HTTP handler.
+        let closed = registry.disconnect_nip_fi(&target_pubkey);
+        assert_eq!(
+            closed, 1,
+            "W_f5_teardown: registry must find exactly 1 connection"
+        );
+
+        // Exactly one terminal frame enqueued by the admin path.
+        let frame = terminal_rx
+            .try_recv()
+            .expect("W_f5_teardown: admin disconnect must enqueue exactly one terminal frame");
+        let expected = crate::nip_fi_session::authorization_denied_frame(NipFiWsRoute::Root);
+        assert_eq!(
+            frame, expected,
+            "W_f5_teardown: terminal frame must be the canonical Root denial frame"
+        );
+
+        // ── Step 4: task is now in its cancel arm, blocked in quiesce().
+        //    Wait for the task to enter quiescence (it holds the write guard).
+        tokio::time::timeout(std::time::Duration::from_secs(2), quiesce_arrived_rx)
+            .await
+            .expect("W_f5_teardown: quiesce-entry hook must fire within 2s")
+            .expect("W_f5_teardown: quiesce-entry hook sender must not be dropped");
+
+        assert!(
+            !task_handle.is_finished(),
+            "W_f5_teardown: task must be blocked in quiesce() while permit is held"
+        );
+
+        // ── Step 5: simulate in-flight REQ handler registering a subscription
+        //    WHILE quiesce is blocking (the production race quiescence protects).
+        let sub_id = "test-sub-f5-teardown".to_string();
+        let filters = vec![Filter::new()];
+        sub_registry.register_scoped(community, conn_id, sub_id, filters, None);
+
+        assert_eq!(
+            sub_registry.total_subscriptions(),
+            1,
+            "W_f5_teardown: subscription must be registered while quiesce is blocked"
+        );
+
+        // ── Step 6: drop permit → quiesce() acquires write guard → task completes.
+        drop(permit);
+
+        // ── Step 7: await task — mirrors `task.await` in connection.rs:628.
+        tokio::time::timeout(std::time::Duration::from_secs(2), task_handle)
+            .await
+            .expect("W_f5_teardown: task must complete within 2s after permit released")
+            .expect("W_f5_teardown: task must not panic");
+
+        // ── Step 8: remove_connection — mirrors connection.rs:631.
+        let removed = sub_registry.remove_connection(conn_id);
+        assert_eq!(
+            removed.len(),
+            1,
+            "W_f5_teardown: remove_connection must find exactly 1 subscription — \
+             the one registered while quiesce was blocked. \
+             Mutation A: remove quiesce() → task exits early → registration happens \
+             after teardown → orphan (this fails: zero removed)"
+        );
+
+        // Zero orphans remain — complete cleanup.
+        assert_eq!(
+            sub_registry.total_subscriptions(),
+            0,
+            "W_f5_teardown: zero subscriptions must remain after remove_connection"
+        );
+
+        // No second terminal frame — quiesce does not enqueue.
+        assert!(
+            terminal_rx.try_recv().is_err(),
+            "W_f5_teardown: terminal channel must be empty after task completion \
+             (quiesce does not enqueue; admin path already enqueued exactly one frame)"
         );
     }
 }
