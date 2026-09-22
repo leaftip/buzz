@@ -235,17 +235,21 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     // cancel. Then cancel to close the socket immediately.
                     //
                     // Fix 4: when an FI assertion is present, NIP-FI §758-776
-                    // requires local-policy denials to expose only
-                    // `restricted: authorization denied` — the specific reason
-                    // (ban vs. error) must not distinguish itself to the caller.
-                    let ws_deny_text = if conn.nip_fi_assertion.is_some() {
-                        "restricted: authorization denied"
+                    // requires the denial to be byte-identical to every other
+                    // FI denial — the canonical NOTICE frame, not an OK false.
+                    // The specific ban/error reason must not distinguish itself.
+                    // [FI-TRACE-DENIAL-ORACLE]
+                    if conn.nip_fi_assertion.is_some() {
+                        let _ = conn.terminal_ctrl_tx.try_send(
+                            crate::nip_fi_session::authorization_denied_frame(
+                                crate::nip_fi_session::NipFiWsRoute::Root,
+                            ),
+                        );
                     } else {
-                        deny_reason
-                    };
-                    let _ = conn.ctrl_tx.try_send(WsMessage::Text(
-                        RelayMessage::ok(&event_id_hex, false, ws_deny_text).into(),
-                    ));
+                        let _ = conn.ctrl_tx.try_send(WsMessage::Text(
+                            RelayMessage::ok(&event_id_hex, false, deny_reason).into(),
+                        ));
+                    }
                     conn.cancel.cancel();
                     return;
                 }
@@ -273,15 +277,24 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                             return;
                         }
                         // Fix 4a: when an FI assertion is present, use the uniform
-                        // NIP-FI denial text so allowlist status is not
-                        // distinguishable from a membership or ban denial.
-                        // [FI-TRACE-DENIAL-ORACLE]
-                        let deny_text = if conn.nip_fi_assertion.is_some() {
-                            "restricted: authorization denied"
+                        // canonical NIP-FI denial frame (NOTICE, not OK) so the
+                        // frame type and body are byte-identical to expiry and
+                        // pairing-mismatch denials — allowlist status is not
+                        // distinguishable. [FI-TRACE-DENIAL-ORACLE]
+                        if conn.nip_fi_assertion.is_some() {
+                            let _ = conn.terminal_ctrl_tx.try_send(
+                                crate::nip_fi_session::authorization_denied_frame(
+                                    crate::nip_fi_session::NipFiWsRoute::Root,
+                                ),
+                            );
+                            conn.cancel.cancel();
                         } else {
-                            "auth-required: verification failed"
-                        };
-                        conn.send(RelayMessage::ok(&event_id_hex, false, deny_text));
+                            conn.send(RelayMessage::ok(
+                                &event_id_hex,
+                                false,
+                                "auth-required: verification failed",
+                            ));
+                        }
                         return;
                     }
                     PolicyCheck::DependencyError => {
@@ -556,13 +569,8 @@ mod tests {
 
     async fn auth_test_state() -> std::sync::Arc<crate::state::AppState> {
         use std::sync::Arc;
-        // Fix 5: hold NIP_FI_ENV_LOCK across Config::from_env() to prevent
-        // racing nip_fi_config tests that mutate NIP-FI env vars under the
-        // same lock. Release before any await point. [FI-TRACE-ENV-RACE]
-        let mut config = {
-            let _env_guard = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
-            crate::config::Config::from_env().expect("default config loads")
-        };
+        // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally. [FI-TRACE-ENV-RACE]
+        let mut config = crate::config::Config::for_test();
         config.require_relay_membership = false;
         config.database_url = "postgres://buzz:buzz_dev@127.0.0.1:1/buzz".to_string();
         config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -805,11 +813,8 @@ mod tests {
             let pool = sqlx::PgPool::connect(&db_url)
                 .await
                 .expect("W1: PostgreSQL must be available — set BUZZ_TEST_DATABASE_URL");
-            // Fix 5: hold NIP_FI_ENV_LOCK across Config::from_env(). [FI-TRACE-ENV-RACE]
-            let mut config = {
-                let _env_guard = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
-                crate::config::Config::from_env().expect("default config loads")
-            };
+            // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally. [FI-TRACE-ENV-RACE]
+            let mut config = crate::config::Config::for_test();
             config.require_relay_membership = false;
             config.database_url = db_url.clone();
             config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -1009,11 +1014,8 @@ mod tests {
             let pool = sqlx::PgPool::connect(&db_url)
                 .await
                 .expect("Fix4a: PostgreSQL must be available");
-            // Fix 5: hold NIP_FI_ENV_LOCK across Config::from_env(). [FI-TRACE-ENV-RACE]
-            let mut config = {
-                let _env_guard = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
-                crate::config::Config::from_env().expect("default config loads")
-            };
+            // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally. [FI-TRACE-ENV-RACE]
+            let mut config = crate::config::Config::for_test();
             config.require_relay_membership = false;
             config.pubkey_allowlist_enabled = true;
             config.database_url = db_url.clone();
@@ -1060,7 +1062,7 @@ mod tests {
             let challenge = "fix-4a-allowlist-challenge".to_string();
             let (send_tx, mut send_rx) = mpsc::channel::<WsMessage>(8);
             let (ctrl_tx, _ctrl_rx) = mpsc::channel::<WsMessage>(8);
-            let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+            let (terminal_ctrl_tx, mut terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
             let cancel = CancellationToken::new();
 
             let conn = Arc::new(crate::connection::ConnectionState {
@@ -1094,24 +1096,39 @@ mod tests {
                 .unwrap();
             handle_auth(auth_event, Arc::clone(&conn), state).await;
 
-            // Must see `restricted: authorization denied` — not the non-FI text.
-            let mut found = false;
+            // Fix 4a: FI-present allowlist denial must use the canonical
+            // NOTICE frame (byte-identical to expiry/pairing-mismatch denials),
+            // NOT an OK envelope. The denial arrives on terminal_ctrl_tx.
+            // The cancel token must be triggered (connection terminates).
+            let expected_frame = crate::nip_fi_session::authorization_denied_frame(
+                crate::nip_fi_session::NipFiWsRoute::Root,
+            );
+            // Ordinary channel must NOT contain the denial (no OK fallthrough).
             while let Ok(frame) = send_rx.try_recv() {
-                if let WsMessage::Text(t) = frame {
-                    if t.contains("restricted: authorization denied") {
-                        found = true;
-                    }
+                if let WsMessage::Text(t) = &frame {
+                    assert!(
+                        !t.contains("restricted: authorization denied"),
+                        "Fix 4a: FI allowlist denial must NOT reach ordinary send channel; got: {t}"
+                    );
                     assert!(
                         !t.contains("auth-required: verification failed"),
-                        "Fix 4a: allowlist denial with FI assertion must NOT expose \
-                         'auth-required: verification failed'; got: {t}"
+                        "Fix 4a: non-FI text must not appear with FI assertion; got: {t}"
                     );
                 }
             }
+            // Terminal channel must contain the exact canonical frame.
+            let terminal_frame = terminal_ctrl_rx
+                .try_recv()
+                .expect("Fix 4a: canonical denial must be on terminal_ctrl_rx");
+            assert_eq!(
+                terminal_frame,
+                expected_frame,
+                "Fix 4a: terminal frame must be the exact canonical authorization_denied_frame"
+            );
+            // Cancel must have fired — connection terminates.
             assert!(
-                found,
-                "Fix 4a: allowlist denial with FI assertion must emit \
-                 'restricted: authorization denied'"
+                cancel.is_cancelled(),
+                "Fix 4a: FI allowlist denial must cancel the connection token"
             );
         }
     }

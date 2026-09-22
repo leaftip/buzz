@@ -34,7 +34,7 @@ mod external_infra {
             let endpoint = std::env::var("BUZZ_TEST_S3_ENDPOINT")
                 .expect("explicit isolated BUZZ_TEST_S3_ENDPOINT");
             let scratch = tempfile::tempdir().unwrap();
-            let mut config = crate::config::Config::from_env().unwrap();
+            let mut config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
             config.database_url = database_url;
             config.redis_url = redis_url;
             config.relay_url = "ws://127.0.0.1".into();

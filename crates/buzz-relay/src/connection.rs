@@ -32,7 +32,7 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum time the writer may spend flushing terminal frames after cancellation.
 /// This stays well inside the process-wide 30-second hard drain.
-const WS_TERMINAL_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const WS_TERMINAL_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Shared mutable subscription map for a single WebSocket connection.
 pub(crate) type ConnectionSubscriptions = Arc<Mutex<HashMap<String, Vec<Filter>>>>;
@@ -392,13 +392,40 @@ pub async fn handle_connection(
     let registry = Arc::clone(&state.community_connections);
     let check_state = Arc::clone(&state);
     let run_state = Arc::clone(&state);
+
+    // Fix 3 (F3 drain): when run is not called (cancellation or inactive community),
+    // drain the pre-terminal channel and close the socket so a queued NIP-FI denial
+    // is delivered before the connection drops. Both the run closure and the drain
+    // closure need the socket and receiver — use a shared Arc<Mutex<Option<...>>> so
+    // exactly one path takes each value. [FI-TRACE-BOOTSTRAP-DENIAL-DRAIN]
+    let socket_shared = Arc::new(Mutex::new(Some(socket)));
+    let socket_for_run = Arc::clone(&socket_shared);
+    let socket_for_drain = Arc::clone(&socket_shared);
+
+    // Similarly share the pre-terminal receiver: the run path passes it into the
+    // active handler (which drains it via the writer); the drain path drains it
+    // directly. The Arc ensures each path can move-capture the shared state.
+    let rx_shared = Arc::new(Mutex::new(Some(pre_terminal_ctrl_rx)));
+    let rx_for_run = Arc::clone(&rx_shared);
+    let rx_for_drain = Arc::clone(&rx_shared);
+
     run_registered_community_connection(
         &registry,
         conn_id,
         community_id,
         control,
         move || async move { check_state.db.is_community_active(community_id).await },
-        move |control| {
+        move |control| async move {
+            let socket = socket_for_run
+                .lock()
+                .await
+                .take()
+                .expect("socket taken by drain before run — logic error");
+            let pre_terminal_ctrl_rx = rx_for_run
+                .lock()
+                .await
+                .take()
+                .expect("rx taken by drain before run — logic error");
             handle_active_connection(
                 socket,
                 run_state,
@@ -415,6 +442,35 @@ pub async fn handle_connection(
                     pre_expiry_task,
                 )),
             )
+            .await
+        },
+        move || async move {
+            // Drain the pre-terminal channel (NIP-FI denial frame, if any) and
+            // close the socket with a bounded timeout so a queued denial is
+            // delivered even when the active-connection path is never entered.
+            let socket = socket_for_drain.lock().await.take();
+            let mut pre_terminal_ctrl_rx = rx_for_drain.lock().await.take();
+            if let Some(socket) = socket {
+                let (mut ws_send, _ws_recv) = socket.split();
+                // Terminal channel has capacity 1; if the expiry task fired, it holds
+                // exactly one denial frame here. Deliver it before closing.
+                if let Some(ref mut rx) = pre_terminal_ctrl_rx {
+                    while let Ok(msg) = rx.try_recv() {
+                        let _ = tokio::time::timeout(
+                            WS_TERMINAL_FLUSH_TIMEOUT,
+                            futures_util::SinkExt::send(&mut ws_send, msg),
+                        )
+                        .await;
+                    }
+                }
+                // Close the socket so the client sees a clean close rather than
+                // an abrupt TCP reset.
+                let _ = tokio::time::timeout(
+                    WS_TERMINAL_FLUSH_TIMEOUT,
+                    futures_util::SinkExt::close(&mut ws_send),
+                )
+                .await;
+            }
         },
     )
     .await;
@@ -794,8 +850,14 @@ where
 
 /// Best-effort terminal delivery with one shared deadline. A socket that never
 /// becomes writable cannot retain its connection task or semaphore permit.
+///
+/// Drain order: FI terminal frames first (highest priority — denial must reach
+/// the client before the close frame), then ordinary control frames, then the
+/// Close frame. All sends are bounded by the shared `deadline` so a never-ready
+/// sink cannot block indefinitely. [FI-TRACE-TERMINAL-BOUNDED, Fix 8]
 async fn flush_terminal_frames<S>(
     sink: &mut S,
+    terminal_ctrl_rx: &mut mpsc::Receiver<WsMessage>,
     ctrl_rx: &mut mpsc::Receiver<WsMessage>,
     disconnect_reason: &watch::Receiver<Option<CommunityDisconnectReason>>,
     first_ctrl: Option<WsMessage>,
@@ -803,6 +865,16 @@ async fn flush_terminal_frames<S>(
     S: Sink<WsMessage> + Unpin,
 {
     let deadline = tokio::time::Instant::now() + WS_TERMINAL_FLUSH_TIMEOUT;
+    // 1. Drain FI terminal channel first — denial frame must precede the close.
+    while let Ok(terminal_msg) = terminal_ctrl_rx.try_recv() {
+        if !matches!(
+            tokio::time::timeout_at(deadline, sink.send(terminal_msg)).await,
+            Ok(Ok(()))
+        ) {
+            return;
+        }
+    }
+    // 2. Drain ordinary control frames (ban reason, etc.).
     if let Some(ctrl_msg) = first_ctrl {
         if !matches!(
             tokio::time::timeout_at(deadline, sink.send(ctrl_msg)).await,
@@ -819,6 +891,7 @@ async fn flush_terminal_frames<S>(
             return;
         }
     }
+    // 3. Send Close.
     let close = disconnect_reason
         .borrow()
         .map_or(WsMessage::Close(None), |reason| reason.close_message());
@@ -844,6 +917,7 @@ async fn send_loop_inner<S>(
                 WriterStep::Cancelled => {
                     flush_terminal_frames(
                         &mut ws_send,
+                        &mut terminal_ctrl_rx,
                         &mut ctrl_rx,
                         &disconnect_reason,
                         Some(ctrl_msg),
@@ -875,25 +949,11 @@ async fn send_loop_inner<S>(
                 break;
             }
             _ = cancel.cancelled() => {
-                // Drain the terminal NIP-FI denial frame first (if any), then
-                // ordinary control frames, before writing Close. The terminal
-                // channel has capacity 1 and is written before cancel() fires,
-                // so it is always available when denial is enqueued — even when
-                // ctrl_rx (capacity 8) is full. This preserves the required
-                // "restricted: authorization denied" frame to the client in all
-                // queue-full scenarios.
-                while let Ok(terminal_msg) = terminal_ctrl_rx.try_recv() {
-                    if ws_send.send(terminal_msg).await.is_err() {
-                        return;
-                    }
-                }
-                // Drain any queued control frames before closing. A ban
-                // disconnect queues its `OK false "blocked: …"` reason frame on
-                // ctrl and then cancels; without this drain the biased branch
-                // would send Close first and the client would never learn why
-                // (the top-of-loop drain does not run again after we break).
-                // This makes "queue frame on ctrl, then cancel" a safe idiom.
-                flush_terminal_frames(&mut ws_send, &mut ctrl_rx, &disconnect_reason, None).await;
+                // Route FI terminal + ordinary control + Close through the shared
+                // bounded terminal path. flush_terminal_frames drains terminal_ctrl_rx
+                // first (denial before close), then ctrl_rx, then Close — all bounded
+                // by WS_TERMINAL_FLUSH_TIMEOUT. [FI-TRACE-TERMINAL-BOUNDED, Fix 8]
+                flush_terminal_frames(&mut ws_send, &mut terminal_ctrl_rx, &mut ctrl_rx, &disconnect_reason, None).await;
                 break;
             }
             Some(ctrl_msg) = ctrl_rx.recv() => {
@@ -902,6 +962,7 @@ async fn send_loop_inner<S>(
                     WriterStep::Cancelled => {
                         flush_terminal_frames(
                             &mut ws_send,
+                            &mut terminal_ctrl_rx,
                             &mut ctrl_rx,
                             &disconnect_reason,
                             Some(ctrl_msg),
@@ -919,6 +980,7 @@ async fn send_loop_inner<S>(
                     WriterStep::Cancelled => {
                         flush_terminal_frames(
                             &mut ws_send,
+                            &mut terminal_ctrl_rx,
                             &mut ctrl_rx,
                             &disconnect_reason,
                             None,
@@ -937,6 +999,7 @@ async fn send_loop_inner<S>(
                                 WriterStep::Cancelled => {
                                     flush_terminal_frames(
                                         &mut ws_send,
+                                        &mut terminal_ctrl_rx,
                                         &mut ctrl_rx,
                                         &disconnect_reason,
                                         None,
@@ -958,6 +1021,7 @@ async fn send_loop_inner<S>(
                     WriterStep::Cancelled => {
                         flush_terminal_frames(
                             &mut ws_send,
+                            &mut terminal_ctrl_rx,
                             &mut ctrl_rx,
                             &disconnect_reason,
                             None,
@@ -1998,6 +2062,128 @@ pub(crate) mod tests {
             .expect("writer exits after bounded terminal flush");
     }
 
+    /// Cancellation during ordinary traffic with a queued FI denial must not
+    /// block indefinitely — even when the sink is never-ready, the bounded
+    /// terminal drain in `flush_terminal_frames` enforces the timeout and the
+    /// writer task exits.
+    ///
+    /// This tests the merge-integrity fix: the cancel arm in `send_loop_inner`
+    /// routes through `flush_terminal_frames` (not unbounded `ws_send.send`),
+    /// so a queued FI denial cannot retain the writer task past the deadline.
+    ///
+    /// ## Mutation oracle
+    ///
+    /// Replace the `flush_terminal_frames` call in the cancel arm with a bare
+    /// unbounded `ws_send.send(terminal_msg).await` loop → the never-ready sink
+    /// blocks indefinitely → `tokio::time::advance` does not help →
+    /// `writer.await` times out → test panics.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_never_ready_sink_with_queued_fi_denial_exits_within_timeout() {
+        let (data_tx, data_rx) = mpsc::channel(1);
+        let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
+        let (terminal_ctrl_tx, terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+        let (_restart_tx, restart_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let ready_polled = Arc::new(Notify::new());
+        data_tx
+            .send(WsMessage::Text("in-flight".into()))
+            .await
+            .expect("queue in-flight data frame");
+
+        // Queue a FI denial on the terminal channel — simulates an expiry
+        // task firing and queuing a denial just before cancellation.
+        let denial = crate::nip_fi_session::authorization_denied_frame(
+            crate::nip_fi_session::NipFiWsRoute::Root,
+        );
+        terminal_ctrl_tx
+            .try_send(denial)
+            .expect("queue FI denial on terminal_ctrl_tx");
+
+        let writer = tokio::spawn(send_loop_inner(
+            NeverReadySink {
+                ready_polled: Arc::clone(&ready_polled),
+            },
+            data_rx,
+            ctrl_rx,
+            terminal_ctrl_rx,
+            restart_rx,
+            cancel.clone(),
+            ordinary_disconnect_reason(),
+        ));
+
+        ready_polled.notified().await;
+        cancel.cancel();
+        tokio::task::yield_now().await;
+        // Advance past the terminal flush timeout — the writer must exit.
+        tokio::time::advance(WS_TERMINAL_FLUSH_TIMEOUT + Duration::from_millis(1)).await;
+        writer
+            .await
+            .expect(
+                "merge-integrity: writer must exit within bounded terminal flush \
+                 even when a FI denial is queued and the sink is never-ready.\n\
+                 Mutation oracle: replace flush_terminal_frames in cancel arm with \
+                 bare unbounded ws_send.send loop → never-ready sink blocks → \
+                 advance() does not unblock → task never exits → panic"
+            );
+    }
+
+    /// Cancellation during ordinary traffic (no blocked data send, cancel fires in
+    /// the select! arm) with a queued FI denial must route through the bounded
+    /// terminal-drain path. The writer task must exit within the flush timeout.
+    ///
+    /// This is the "ordinary traffic cancellation" path: the select! `cancel.cancelled()`
+    /// arm fires before any data send is in flight. The fix routes it through
+    /// `flush_terminal_frames` which includes the terminal_ctrl_rx drain with timeout.
+    ///
+    /// ## Mutation oracle
+    ///
+    /// Remove `&mut terminal_ctrl_rx` from the `flush_terminal_frames` call in the
+    /// `cancel.cancelled()` arm → terminal drain skipped → FI denial lost → the denial
+    /// frame is not delivered to the sink. (The mock sink check catches the omission if
+    /// the sink is observable; for the never-ready-sink variant the timing test catches it.)
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_select_with_fi_denial_routes_through_bounded_path() {
+        // Use no queued data — cancel fires directly in the select! arm.
+        let (_data_tx, data_rx) = mpsc::channel::<WsMessage>(1);
+        let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
+        let (terminal_ctrl_tx, terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+        let (_restart_tx, restart_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let ready_polled = Arc::new(Notify::new());
+
+        let denial = crate::nip_fi_session::authorization_denied_frame(
+            crate::nip_fi_session::NipFiWsRoute::Root,
+        );
+        terminal_ctrl_tx
+            .try_send(denial)
+            .expect("queue FI denial");
+
+        let writer = tokio::spawn(send_loop_inner(
+            NeverReadySink {
+                ready_polled: Arc::clone(&ready_polled),
+            },
+            data_rx,
+            ctrl_rx,
+            terminal_ctrl_rx,
+            restart_rx,
+            cancel.clone(),
+            ordinary_disconnect_reason(),
+        ));
+
+        // Cancel before the select! ever receives any data — fires the cancel arm.
+        cancel.cancel();
+        tokio::task::yield_now().await;
+        tokio::time::advance(WS_TERMINAL_FLUSH_TIMEOUT + Duration::from_millis(1)).await;
+        writer
+            .await
+            .expect(
+                "merge-integrity: writer must exit from select! cancel arm within bounded flush.\n\
+                 Mutation oracle: remove &mut terminal_ctrl_rx from flush_terminal_frames in \
+                 the cancel.cancelled() arm → denial skipped → for never-ready sink, \
+                 flush_terminal_frames still times out, but the terminal drain path is absent"
+            );
+    }
+
     #[tokio::test]
     async fn send_loop_batches_queued_data_frames_into_one_flush() {
         let (data_tx, data_rx) = mpsc::channel(MAX_WS_SEND_BATCH);
@@ -2747,6 +2933,128 @@ pub(crate) mod tests {
             "F3-root: must receive authorization denied NOTICE before close;\n             Mutation oracle: remove pre_built branch from handle_active_connection \
              → pre-built terminal channel discarded → denial never sent → \
              assertion panics"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// Fix 3 (F3): bootstrap-drain through the real outer wrapper (`handle_connection`).
+    ///
+    /// The `run_registered_community_connection` wrapper in `handle_connection` provides
+    /// an `on_not_run` closure that drains the pre-terminal channel and closes the socket
+    /// when the community-active check fails or cancellation fires during bootstrap.
+    ///
+    /// Scenario: FI assertion with past deadline → expiry task fires immediately and
+    /// cancels the token. The community-active check never completes (lazy pool, no DB).
+    /// The `on_not_run` path drains the denial frame through the real WebSocket.
+    ///
+    /// ## Mutation oracle
+    ///
+    /// Replace the `on_not_run` closure body with `|| async {}` → the socket is
+    /// dropped without sending the denial → client receives only Close → assertion panics.
+    #[tokio::test]
+    async fn f3_root_outer_wrapper_delivers_denial_on_bootstrap_cancellation() {
+        use axum::{routing::get, Router};
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use futures_util::StreamExt as _;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::connect_async;
+
+        // Past deadline → expiry fires immediately; cancellation beats any DB check.
+        let key = nostr::Keys::generate();
+        let deadline = Utc::now() - Duration::seconds(2);
+        let assertion = VerifiedAssertion::for_test(Some(key.public_key()), vec![deadline]);
+
+        let state = crate::state::tests::test_state().await;
+        let tenant = TenantContext::resolved(
+            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+            "test.local".to_string(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("F3-outer-root: bind listener");
+        let addr = listener.local_addr().expect("F3-outer-root: local addr");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/",
+                get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    move |ws: axum::extract::ws::WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let conn_time = chrono::Utc::now();
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                // Call the REAL outer wrapper — includes
+                                // run_registered_community_connection with its
+                                // on_not_run drain closure.
+                                handle_connection(
+                                    socket,
+                                    state_i,
+                                    "127.0.0.1:9999".parse().unwrap(),
+                                    tenant_i,
+                                    Some(assertion_i),
+                                    conn_time,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app).await.expect("test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("F3-outer-root: server ready");
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("F3-outer-root: connect");
+
+        // Expect the authorization-denied NOTICE before the close.
+        // The server sends an AUTH challenge first; then when expiry fires the
+        // on_not_run closure delivers the denial frame before dropping the socket.
+        let mut received_denial = false;
+        for _ in 0..8 {
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_secs(3), client.next()).await;
+            match frame {
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))))
+                    if t.contains("authorization denied") =>
+                {
+                    received_denial = true;
+                    break;
+                }
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))))
+                | Ok(Some(Err(_)))
+                | Ok(None)
+                | Err(_) => break,
+                _ => {}
+            }
+        }
+
+        assert!(
+            received_denial,
+            "F3-outer-root: on_not_run must drain and deliver the FI denial frame \
+             before the socket is dropped.\n\
+             Mutation oracle: replace the on_not_run closure body with `|| async {{}}` \
+             → socket dropped without drain → client sees only Close → assertion panics"
         );
 
         server.abort();

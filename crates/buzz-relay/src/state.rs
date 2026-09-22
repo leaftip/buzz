@@ -192,23 +192,32 @@ impl Drop for CommunityConnectionGuard {
 /// `check_active()` is awaited inside a `select!` against the registration's
 /// cancellation token. If the token fires while the DB check is in flight
 /// (e.g., a stalled DB holds an expired socket open), the check is abandoned,
-/// the terminal denial frame is drained from `terminal_ctrl_tx` (if any) and
-/// forwarded to the caller-supplied drain sink, and the socket is dropped
-/// without ever invoking `run`. This ensures a community deletion or NIP-FI
-/// expiry that fires during bootstrap terminates the socket promptly rather
-/// than waiting for a stalled DB. [Fix 3 / Carl 3 / F3]
-pub(crate) async fn run_registered_community_connection<Check, CheckFuture, Run, RunFuture>(
+/// `on_not_run()` is called for terminal-frame drain (if any), and the socket
+/// is dropped without ever invoking `run`. This ensures a community deletion
+/// or NIP-FI expiry that fires during bootstrap terminates the socket promptly
+/// rather than waiting for a stalled DB. [Fix 3 / Carl 3 / F3]
+pub(crate) async fn run_registered_community_connection<
+    Check,
+    CheckFuture,
+    Run,
+    RunFuture,
+    OnNotRun,
+    OnNotRunFuture,
+>(
     registry: &CommunityConnectionRegistry,
     connection_id: Uuid,
     community_id: CommunityId,
     control: CommunityConnectionControl,
     check_active: Check,
     run: Run,
+    on_not_run: OnNotRun,
 ) where
     Check: FnOnce() -> CheckFuture,
     CheckFuture: Future<Output = Result<bool, buzz_db::DbError>>,
     Run: FnOnce(CommunityConnectionControl) -> RunFuture,
     RunFuture: Future<Output = ()>,
+    OnNotRun: FnOnce() -> OnNotRunFuture,
+    OnNotRunFuture: Future<Output = ()>,
 {
     let cancel = control.cancel.clone();
     let _guard = registry.register(connection_id, community_id, control.clone());
@@ -218,8 +227,10 @@ pub(crate) async fn run_registered_community_connection<Check, CheckFuture, Run,
     let check_result = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            // Cancellation won — do NOT invoke run.
-            cancel.cancel();
+            // Cancellation won — do NOT invoke run; drain terminal frames and
+            // close the socket via the caller-supplied on_not_run path so a
+            // queued NIP-FI denial is delivered even when bootstrap stalls.
+            on_not_run().await;
             return;
         }
         result = check_active() => result,
@@ -227,9 +238,11 @@ pub(crate) async fn run_registered_community_connection<Check, CheckFuture, Run,
 
     if !matches!(check_result, Ok(true)) {
         cancel.cancel();
+        on_not_run().await;
         return;
     }
     if cancel.is_cancelled() {
+        on_not_run().await;
         return;
     }
     run(control).await;
@@ -1556,12 +1569,8 @@ pub(crate) mod tests {
     /// checks resolve to `AdmissionError::Unavailable` without any live
     /// infrastructure. Shared with `crate::rejection`'s tests.
     pub(crate) async fn test_state() -> Arc<AppState> {
-        // Fix 5: hold NIP_FI_ENV_LOCK across Config::from_env() to prevent
-        // racing nip_fi_config tests that mutate NIP-FI env vars. [FI-TRACE-ENV-RACE]
-        let mut config = {
-            let _env_guard = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
-            crate::config::Config::from_env().expect("default config loads")
-        };
+        // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally. [FI-TRACE-ENV-RACE]
+        let mut config = crate::config::Config::for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
@@ -1572,11 +1581,8 @@ pub(crate) mod tests {
     /// tests deterministically exercise fail-closed database seams without
     /// depending on whether a developer has the normal test database running.
     pub(crate) async fn test_state_with_database_url(database_url: &str) -> Arc<AppState> {
-        // Fix 5: hold NIP_FI_ENV_LOCK across Config::from_env(). [FI-TRACE-ENV-RACE]
-        let mut config = {
-            let _env_guard = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
-            crate::config::Config::from_env().expect("default config loads")
-        };
+        // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally. [FI-TRACE-ENV-RACE]
+        let mut config = crate::config::Config::for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.database_url = database_url.to_owned();
@@ -1592,11 +1598,8 @@ pub(crate) mod tests {
     /// lifecycle tests use this to hold the sole connection as a deterministic
     /// barrier while AUTH waits in the real database acquisition path.
     pub(crate) async fn test_state_with_database_pool(pool: sqlx::PgPool) -> Arc<AppState> {
-        // Fix 5: hold NIP_FI_ENV_LOCK across Config::from_env(). [FI-TRACE-ENV-RACE]
-        let mut config = {
-            let _env_guard = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
-            crate::config::Config::from_env().expect("default config loads")
-        };
+        // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally. [FI-TRACE-ENV-RACE]
+        let mut config = crate::config::Config::for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.read_database_url = None;
@@ -2105,6 +2108,7 @@ pub(crate) mod tests {
             CommunityConnectionControl::new(cancel_before.clone()),
             || async { Ok(false) },
             move |_| async move { started_before_run.store(true, Ordering::SeqCst) },
+            || async {},
         )
         .await;
         assert!(cancel_before.is_cancelled());
@@ -2131,6 +2135,7 @@ pub(crate) mod tests {
                 Ok(true)
             },
             move |_| async move { started_during_run.store(true, Ordering::SeqCst) },
+            || async {},
         );
         tokio::pin!(future);
         tokio::select! {
@@ -2190,6 +2195,7 @@ pub(crate) mod tests {
                 Ok(true) // Would admit the socket if the select! weren't there.
             },
             move |_| async move { started_run.store(true, Ordering::SeqCst) },
+            || async {},
         );
 
         tokio::pin!(future);

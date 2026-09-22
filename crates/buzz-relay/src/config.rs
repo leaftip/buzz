@@ -1276,6 +1276,27 @@ impl Config {
             nip_fi: crate::nip_fi_config::NipFiRelayConfig::from_env()?,
         })
     }
+
+    /// Build a baseline `Config` suitable for test fixtures that need a
+    /// structurally valid config without caring about specific field values.
+    ///
+    /// Equivalent to `from_env()` with all env variables absent, but calls
+    /// that function while holding `NIP_FI_ENV_LOCK` so that concurrent NIP-FI
+    /// env-writer tests cannot produce a partially-written env state that this
+    /// call observes.  Every test fixture that previously called
+    /// `Config::from_env().expect("…")` should use this instead — it is the
+    /// only env-isolation-safe way to obtain a default config in test code.
+    ///
+    /// Fields that differ from production defaults (`database_url`,
+    /// `redis_url`, etc.) should be overridden on the returned struct after
+    /// calling this function, exactly as was done before.
+    ///
+    /// [FI-TRACE-ENV-RACE]
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let _fi_guard = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
+        Self::from_env().expect("default config must load for test fixture")
+    }
 }
 
 #[cfg(test)]

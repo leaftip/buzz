@@ -771,7 +771,7 @@ mod tests {
     /// Relay state serving both bundles: the admin SPA on `admin.example` and
     /// the public SPA on any other host.
     async fn spa_state(admin_dir: &std::path::Path, web_dir: &std::path::Path) -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        let mut config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.web_dir = Some(web_dir.to_path_buf());
@@ -814,7 +814,7 @@ mod tests {
     }
 
     async fn readiness_state(evaluator: Arc<dyn readiness::ReadinessEvaluator>) -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        let mut config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
         config.require_relay_membership = false;
         config.database_url = "postgres://buzz:buzz_dev@127.0.0.1:1/buzz".to_string();
         config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -1541,16 +1541,9 @@ mod tests {
         use crate::nip_fi_config::NipFiRelayConfig;
         use buzz_auth::{IssuerRegistry, NipFiMode};
 
-        // Fix 5: acquire the module-level NIP_FI_ENV_LOCK before calling
-        // Config::from_env() so this fixture never races nip_fi_config's own
-        // tests that temporarily mutate NIP-FI env vars under the same lock.
-        // Drop the guard before any await point — `Config::from_env()` is sync,
-        // so the lock only needs to cover the env read, not the async setup.
-        // [FI-TRACE-ENV-RACE]
-        let mut config = {
-            let _env_guard = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
-            crate::config::Config::from_env().expect("default config loads")
-        };
+        // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally,
+        // so this fixture never races nip_fi_config's own tests. [FI-TRACE-ENV-RACE]
+        let mut config = crate::config::Config::for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         // Override NIP-FI mode to Enforce with no issuers configured — the
@@ -1900,10 +1893,7 @@ mod tests {
             let db_url = crate::test_support::database_url();
             let pool = sqlx::PgPool::connect(&db_url).await.ok()?;
 
-            let mut config = {
-                let _g = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
-                crate::config::Config::from_env().expect("default config loads")
-            };
+            let mut config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
             config.require_relay_membership = false;
             config.redis_url = "redis://127.0.0.1:1".to_string();
             config.database_url = db_url;

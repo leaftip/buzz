@@ -3868,7 +3868,7 @@ mod postgres_tests {
     ///
     /// Returns `None` when local Postgres is not reachable.
     pub(super) async fn bridge_handler_test_state() -> Option<Arc<crate::state::AppState>> {
-        let mut config = crate::config::Config::from_env().ok()?;
+        let mut config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
         config.database_url = crate::test_support::database_url();
         // Use the real local Redis so enforce_http_admission can pass.
         config.redis_url =

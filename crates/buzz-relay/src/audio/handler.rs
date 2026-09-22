@@ -183,7 +183,8 @@ fn default_protocol_version() -> u8 {
     1
 }
 
-async fn handle_audio_connection(
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) async fn handle_audio_connection(
     socket: WebSocket,
     state: Arc<AppState>,
     tenant: TenantContext,
@@ -231,13 +232,37 @@ async fn handle_audio_connection(
     let registry = Arc::clone(&state.community_connections);
     let check_state = Arc::clone(&state);
     let run_state = Arc::clone(&state);
+
+    // Fix 3 (F3 drain): mirror the root-path drain so a NIP-FI denial queued
+    // during stalled bootstrap is delivered on the audio path too.
+    // Both the run and drain closures need the socket and pre-terminal receiver;
+    // wrap each in Arc<Mutex<Option<...>>> so exactly one path takes each value.
+    // [FI-TRACE-BOOTSTRAP-DENIAL-DRAIN]
+    let socket_shared = Arc::new(tokio::sync::Mutex::new(Some(socket)));
+    let socket_for_run = Arc::clone(&socket_shared);
+    let socket_for_drain = Arc::clone(&socket_shared);
+
+    let rx_shared = Arc::new(tokio::sync::Mutex::new(Some(pre_terminal_ctrl_rx)));
+    let rx_for_run = Arc::clone(&rx_shared);
+    let rx_for_drain = Arc::clone(&rx_shared);
+
     run_registered_community_connection(
         &registry,
         Uuid::new_v4(),
         community_id,
         control,
         move || async move { check_state.db.is_community_active(community_id).await },
-        move |control| {
+        move |control| async move {
+            let socket = socket_for_run
+                .lock()
+                .await
+                .take()
+                .expect("socket taken by audio drain before run — logic error");
+            let pre_terminal_ctrl_rx = rx_for_run
+                .lock()
+                .await
+                .take()
+                .expect("audio rx taken by drain before run — logic error");
             handle_active_audio_connection(
                 socket,
                 run_state,
@@ -253,6 +278,28 @@ async fn handle_audio_connection(
                     pre_expiry_task,
                 )),
             )
+            .await
+        },
+        move || async move {
+            let socket = socket_for_drain.lock().await.take();
+            let mut pre_terminal_ctrl_rx = rx_for_drain.lock().await.take();
+            if let Some(socket) = socket {
+                let (mut ws_send, _ws_recv) = socket.split();
+                if let Some(ref mut rx) = pre_terminal_ctrl_rx {
+                    while let Ok(msg) = rx.try_recv() {
+                        let _ = tokio::time::timeout(
+                            crate::connection::WS_TERMINAL_FLUSH_TIMEOUT,
+                            futures_util::SinkExt::send(&mut ws_send, msg),
+                        )
+                        .await;
+                    }
+                }
+                let _ = tokio::time::timeout(
+                    crate::connection::WS_TERMINAL_FLUSH_TIMEOUT,
+                    futures_util::SinkExt::close(&mut ws_send),
+                )
+                .await;
+            }
         },
     )
     .await;
@@ -552,18 +599,24 @@ pub(crate) async fn handle_active_audio_connection(
         // Fix 4: when an FI assertion is present, use the uniform NIP-FI denial
         // text so relay-membership status is not distinguishable.
         // [FI-TRACE-DENIAL-ORACLE, NIP-FI §authorization_denied]
-        let deny_msg = if nip_fi_assertion.is_some() {
-            "restricted: authorization denied"
+        let _ = if nip_fi_assertion.is_some() {
+            // Fix 4b: route through the canonical constructor when FI assertion
+            // is present — emits `{"type":"restricted",...}`, byte-exact denial.
+            // [FI-TRACE-DENIAL-ORACLE, NIP-FI §authorization_denied]
+            ws_send
+                .send(crate::nip_fi_session::authorization_denied_frame(
+                    crate::nip_fi_session::NipFiWsRoute::Audio,
+                ))
+                .await
         } else {
-            "restricted: not a relay member"
+            ws_send
+                .send(WsMessage::Text(
+                    serde_json::json!({"type": "error", "message": "restricted: not a relay member"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
         };
-        let _ = ws_send
-            .send(WsMessage::Text(
-                serde_json::json!({"type": "error", "message": deny_msg})
-                    .to_string()
-                    .into(),
-            ))
-            .await;
         return;
     }
     check_cancel!();
@@ -581,21 +634,24 @@ pub(crate) async fn handle_active_audio_connection(
         Ok(admission) => admission,
         Err(e) => {
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership denied: {e}");
-            // Fix 4: when an FI assertion is present, use the uniform NIP-FI
-            // denial text so channel-membership status is not distinguishable.
-            // [FI-TRACE-DENIAL-ORACLE, NIP-FI §authorization_denied]
-            let deny_msg = if nip_fi_assertion.is_some() {
-                "restricted: authorization denied"
+            let _ = if nip_fi_assertion.is_some() {
+                // Fix 4b: route through the canonical constructor when FI assertion
+                // is present — emits `{"type":"restricted",...}`, byte-exact denial.
+                // [FI-TRACE-DENIAL-ORACLE, NIP-FI §authorization_denied]
+                ws_send
+                    .send(crate::nip_fi_session::authorization_denied_frame(
+                        crate::nip_fi_session::NipFiWsRoute::Audio,
+                    ))
+                    .await
             } else {
-                "not a member"
+                ws_send
+                    .send(WsMessage::Text(
+                        serde_json::json!({"type": "error", "message": "not a member"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
             };
-            let _ = ws_send
-                .send(WsMessage::Text(
-                    serde_json::json!({"type":"error","message": deny_msg})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
             return;
         }
     };
@@ -1143,6 +1199,12 @@ pub(crate) async fn handle_active_audio_connection(
         &membership_admission,
         &audio_gate,
         &room,
+        // Fix 7a cross-pod: on the ingress pod the local room is empty except for
+        // the joining peer; the authoritative peer list is on the owner pod and was
+        // returned at RegisterPeer time as session.roster(). Pass it here so the
+        // `joined` payload's peers[] includes Alice and any other owner-pod participants.
+        // Same-pod joins pass None — room.roster_snapshot() is authoritative there.
+        guard.remote_session.as_ref().map(|s| s.roster()),
     )
     .await
     {
@@ -2278,6 +2340,13 @@ async fn commit_participant_join(
     membership_admission: &MembershipAdmission,
     gate: &std::sync::Arc<crate::nip_fi_gate::SessionAdmissionGate>,
     room: &std::sync::Arc<crate::audio::room::Room>,
+    // Fix 7a cross-pod: when the joining peer is on a non-owner (ingress) pod,
+    // the ingress-local `room` only contains the joining peer — Alice and other
+    // owner-pod peers are invisible to it. Pass the authoritative owner roster
+    // from `RemoteHuddleSession.roster()` so the `joined` payload's `peers[]`
+    // contains every live participant. `None` for same-pod joins (local room is
+    // authoritative). [FI-TRACE-JOINED-PAYLOAD-COMMITTED]
+    owner_roster: Option<&crate::audio::join::RosterSnapshot>,
 ) -> Result<CommitJoinOutcome, JoinCommitError> {
     // 1. Sign the 48101 event synchronously.
     //
@@ -2511,17 +2580,35 @@ async fn commit_participant_join(
     // before commit would omit the joining peer from peers[], causing already-
     // connected clients to drop the joiner's audio stream.
     // [FI-TRACE-JOINED-PAYLOAD-COMMITTED]
-    let joined_snapshot = room.roster_snapshot();
-    let joined_peers: Vec<serde_json::Value> = joined_snapshot
-        .peers
-        .iter()
-        .map(|p| {
-            serde_json::json!({"pubkey": p.pubkey, "peer_index": p.peer_index, "epoch": p.epoch})
-        })
-        .collect();
+    //
+    // Cross-pod path: `owner_roster` is the authoritative owner-pod roster
+    // returned at `RegisterPeer` time (already includes the joining peer and
+    // all owner-pod participants). Use it instead of the ingress-local room
+    // snapshot, which only contains the joining peer.
+    let (joined_revision, joined_peers): (u64, Vec<serde_json::Value>) =
+        if let Some(owner) = owner_roster {
+            let peers = owner
+                .peers
+                .iter()
+                .map(|p| {
+                    serde_json::json!({"pubkey": p.pubkey, "peer_index": p.peer_index, "epoch": p.epoch})
+                })
+                .collect();
+            (owner.revision, peers)
+        } else {
+            let joined_snapshot = room.roster_snapshot();
+            let peers = joined_snapshot
+                .peers
+                .iter()
+                .map(|p| {
+                    serde_json::json!({"pubkey": p.pubkey, "peer_index": p.peer_index, "epoch": p.epoch})
+                })
+                .collect();
+            (joined_snapshot.revision, peers)
+        };
     let joined_msg = serde_json::json!({
         "type": "joined",
-        "revision": joined_snapshot.revision,
+        "revision": joined_revision,
         "pubkey": pubkey_hex,
         "peer_index": peer_index,
         "epoch": peer_epoch,
@@ -2996,12 +3083,8 @@ mod tests {
 
     async fn audio_test_state() -> std::sync::Arc<crate::state::AppState> {
         use std::sync::Arc;
-        // Fix 5: hold NIP_FI_ENV_LOCK across Config::from_env() to prevent
-        // racing nip_fi_config tests that mutate NIP-FI env vars. [FI-TRACE-ENV-RACE]
-        let mut config = {
-            let _env_guard = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
-            crate::config::Config::from_env().expect("default config loads")
-        };
+        // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally. [FI-TRACE-ENV-RACE]
+        let mut config = crate::config::Config::for_test();
         config.require_relay_membership = false;
         config.database_url = "postgres://buzz:buzz_dev@127.0.0.1:1/buzz".to_string();
         config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -3948,11 +4031,8 @@ mod tests {
         if sqlx::PgPool::connect(&db_url).await.is_err() {
             return None;
         }
-        // Fix 5: hold NIP_FI_ENV_LOCK across Config::from_env(). [FI-TRACE-ENV-RACE]
-        let mut config = {
-            let _env_guard = crate::nip_fi_config::NIP_FI_ENV_LOCK.lock().unwrap();
-            crate::config::Config::from_env().expect("default config loads")
-        };
+        // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally. [FI-TRACE-ENV-RACE]
+        let mut config = crate::config::Config::for_test();
         config.require_relay_membership = false;
         config.database_url = db_url.clone();
         config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -4509,6 +4589,136 @@ mod tests {
         let _ = server.await;
     }
 
+    /// Fix 3 (F3): bootstrap-drain through the real outer wrapper (`handle_audio_connection`).
+    ///
+    /// The `run_registered_community_connection` wrapper in `handle_audio_connection`
+    /// provides an `on_not_run` closure that drains the pre-terminal channel and closes the
+    /// socket when the community-active check fails or cancellation fires during bootstrap.
+    ///
+    /// Scenario: FI assertion with past deadline → expiry task fires immediately and
+    /// cancels the token before the DB check completes. The `on_not_run` path drains the
+    /// denial frame through the real WebSocket.
+    ///
+    /// ## Mutation oracle
+    ///
+    /// Replace the `on_not_run` closure body with `move || async move {}` → the socket is
+    /// dropped without sending the denial → client receives only Close → assertion panics.
+    #[tokio::test]
+    async fn f3_audio_outer_wrapper_delivers_denial_on_bootstrap_cancellation() {
+        use axum::{routing::get, Router};
+        use axum::extract::ws::WebSocketUpgrade;
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use futures_util::StreamExt as _;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::connect_async;
+
+        // Past deadline → expiry fires immediately; cancel beats any DB check.
+        let key = nostr::Keys::generate();
+        let deadline = Utc::now() - Duration::seconds(2);
+        let assertion = VerifiedAssertion::for_test(Some(key.public_key()), vec![deadline]);
+        let channel_id = uuid::Uuid::new_v4();
+
+        let state = audio_test_state().await;
+        let tenant = buzz_core::tenant::TenantContext::resolved(
+            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+            "test.local".to_string(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("F3-outer-audio: bind listener");
+        let addr = listener.local_addr().expect("F3-outer-audio: local addr");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/",
+                get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    move |ws: WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let conn_time = chrono::Utc::now();
+                        // Acquire a semaphore permit for the connection — mirrors the
+                        // production path in `audio_connection_handler`.
+                        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+                        let permit = Arc::clone(&semaphore)
+                            .try_acquire_owned()
+                            .expect("F3-outer-audio: acquire permit");
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                // Call the REAL outer wrapper — includes
+                                // run_registered_community_connection with its
+                                // on_not_run drain closure.
+                                handle_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    channel_id,
+                                    permit,
+                                    Some(assertion_i),
+                                    conn_time,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app).await.expect("test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("F3-outer-audio: server ready");
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("F3-outer-audio: connect");
+
+        // The expiry fires before any bootstrap — expect the denial JSON frame
+        // before the socket closes.
+        let mut received_denial = false;
+        for _ in 0..8 {
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_secs(3), client.next()).await;
+            match frame {
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))))
+                    if t.contains("authorization denied") =>
+                {
+                    received_denial = true;
+                    break;
+                }
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))))
+                | Ok(Some(Err(_)))
+                | Ok(None)
+                | Err(_) => break,
+                _ => {}
+            }
+        }
+
+        assert!(
+            received_denial,
+            "F3-outer-audio: on_not_run must drain and deliver the FI denial frame \
+             before the socket is dropped.\n\
+             Mutation oracle: replace the on_not_run closure body with `move || async move {{}}` \
+             → socket dropped without drain → client sees only Close → assertion panics"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
     // All tests require a real PostgreSQL instance. They live in `postgres_tests`
     // and are gated with `#[ignore = "requires Postgres — runs in postgres-ci
     // nextest lane"]` so they do not run in unit-test mode where no DB is
@@ -4583,6 +4793,7 @@ mod tests {
                     tenant.community(),
                     channel_id,
                 )),
+            None, // same-pod test — no owner roster
             )
             .await;
 
@@ -4685,6 +4896,7 @@ mod tests {
                         tenant2.community(),
                         channel_id,
                     )),
+                None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -4890,6 +5102,7 @@ mod tests {
                         tenant2.community(),
                         child_channel_id,
                     )),
+                None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5023,6 +5236,7 @@ mod tests {
                         tenant2.community(),
                         channel_id,
                     )),
+                None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5159,6 +5373,7 @@ mod tests {
                         tenant_a.community(),
                         channel_id,
                     )),
+                None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5202,6 +5417,7 @@ mod tests {
                         tenant_b.community(),
                         channel_id,
                     )),
+                None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5308,6 +5524,7 @@ mod tests {
                         tenant1.community(),
                         channel_id,
                     )),
+                None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5351,6 +5568,7 @@ mod tests {
                         tenant2.community(),
                         channel_id,
                     )),
+                None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5584,6 +5802,7 @@ mod tests {
                         tenant2.community(),
                         child_channel_id,
                     )),
+                None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -5778,6 +5997,7 @@ mod tests {
                         tenant2.community(),
                         channel_id,
                     )),
+                None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -6342,6 +6562,7 @@ mod tests {
                         tenant2.community(),
                         channel_id,
                     )),
+                None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -6714,6 +6935,7 @@ mod tests {
                 },
                 &gate,
                 &room,
+            None, // same-pod test — no owner roster
             )
             .await;
 
@@ -6780,8 +7002,8 @@ mod tests {
         // Mutation oracle:
         //   Change `FOR NO KEY UPDATE` back to `FOR UPDATE` in
         //   `commit_participant_join` → `add_member`'s FK KEY SHARE blocks on
-        //   FOR UPDATE → lock_timeout fires → sqlx returns Err(55P03) →
-        //   `add_member_completed` is false → assertion panics.
+        //   FOR UPDATE → the 3-second tokio::time::timeout fires → synthesized
+        //   error → `add_member_completed` is false → assertion panics.
 
         /// F2 (lock-order fix witness): `FOR NO KEY UPDATE` allows concurrent
         /// `add_member` to proceed — no deadlock between join and membership-add.
@@ -6839,6 +7061,7 @@ mod tests {
                     },
                     &gate2,
                     &room2,
+                None, // same-pod test — no owner roster
                 )
                 .await
             });
@@ -6892,7 +7115,9 @@ mod tests {
                 "F2d: add_member must complete while join holds FOR NO KEY UPDATE — \
                  got {add_result:?}\n\
                  Mutation oracle: change FOR NO KEY UPDATE to FOR UPDATE → \
-                 add_member's FK KEY SHARE blocks → 55P03 → this assertion panics"
+                 add_member's FK KEY SHARE blocks until join releases → \
+                 tokio::time::timeout fires (3s) → synthesized error → \
+                 this assertion panics"
             );
             assert!(
                 join_result.is_ok(),
@@ -7031,6 +7256,7 @@ mod tests {
                 },
                 &gate,
                 &room,
+            None, // same-pod test — no owner roster
             )
             .await;
             assert!(
@@ -7075,6 +7301,185 @@ mod tests {
             assert!(
                 peers_pubkeys.contains(&alice_hex.as_str()),
                 "F7a: joined peers[] must include the already-committed peer (alice); got peers={peers_pubkeys:?}"
+            );
+
+            // Carol (pending, never committed) must NOT appear — pending peers
+            // are invisible until their own commit_participant_join marks them.
+            let carol_key = nostr::Keys::generate();
+            let carol_hex = carol_key.public_key().to_hex();
+            let _ = room
+                .add_peer(carol_hex.clone(), 2)
+                .expect("F7a: add carol as pending peer");
+            // Do NOT call mark_committed for carol — she stays pending.
+            // Re-take the snapshot to prove the filter is active post-bob-commit.
+            let snapshot_after = room.roster_snapshot();
+            let pending_pubkeys: Vec<&str> = snapshot_after
+                .peers
+                .iter()
+                .map(|p| p.pubkey.as_str())
+                .collect();
+            assert!(
+                !pending_pubkeys.contains(&carol_hex.as_str()),
+                "F7a: pending peer (carol) must be excluded from roster_snapshot; \
+                 got peers={pending_pubkeys:?}\n\
+                 Mutation oracle: remove committed-only filter from Room::roster_snapshot → \
+                 carol appears → this assertion panics"
+            );
+        }
+
+        // ── F7a cross-pod: joined payload includes owner-pod peers for remote joins ──
+        //
+        // On a cross-pod join (ingress pod != owner pod), `commit_participant_join` is
+        // called with `owner_roster = Some(...)` containing all owner-pod participants.
+        // The `joined` broadcast must include those peers, not just the ingress-local room.
+        //
+        // Without Fix 7a cross-pod, the ingress-local room.roster_snapshot() only contains
+        // the joining peer — Alice (on the owner pod) would be absent from the broadcast,
+        // and desktop would drop her audio stream (unmapped peer index).
+        //
+        // This test simulates the two-pod schedule:
+        // - Alice is the already-live owner-pod peer (in `owner_snapshot`, not in local `room`)
+        // - Bob is the new ingress joiner (in local `room` but NOT in the owner roster yet)
+        // - `owner_roster` carries Alice + Bob (as returned by RegisterPeer on the owner pod)
+        //
+        // ## Mutation oracle
+        //
+        // Remove the `owner_roster` parameter (use `None` on all paths) → the `joined`
+        // broadcast uses the ingress-local room snapshot → only Bob present → Alice absent
+        // → `peers_pubkeys.contains(&alice_hex)` panics.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn f7a_cross_pod_joined_payload_includes_owner_pod_peers() {
+            use chrono::{Duration, Utc};
+            use std::sync::Arc;
+
+            let state = audio_test_state_real_db()
+                .await
+                .expect("F7a-cross-pod: PostgreSQL must be available");
+            let pool = state.db.pool().clone();
+            let (tenant, channel_id, alice_key) = seed_audio_fixture(&pool).await;
+            let community_id = tenant.community();
+
+            let bob_key = nostr::Keys::generate();
+            let bob_bytes = bob_key.public_key().to_bytes().to_vec();
+            let bob_hex = bob_key.public_key().to_hex();
+            buzz_db::channel_members::add_member(
+                &pool,
+                community_id,
+                channel_id,
+                &bob_bytes,
+                buzz_db::channel_members::MemberRole::Member,
+                None,
+            )
+            .await
+            .expect("F7a-cross-pod: seed bob as member");
+
+            // Ingress-local room: has a listener peer (committed) and bob (pending).
+            // Alice is NOT in this room — she lives on the owner pod.
+            let ingress_room = Arc::new(crate::audio::room::Room::new(community_id, channel_id));
+
+            // Listener: committed peer on ingress; its ctrl_rx receives the broadcast.
+            let listener_key = nostr::Keys::generate();
+            let listener_hex = listener_key.public_key().to_hex();
+            let (listener_id, _, _, _, mut listener_ctrl_rx, _) = ingress_room
+                .add_peer(listener_hex.clone(), 2)
+                .expect("F7a-cross-pod: add listener");
+            ingress_room.mark_committed(listener_id);
+
+            // Bob: pending in ingress room; mark_committed happens inside commit_participant_join.
+            let (bob_id, bob_index, bob_epoch, _, _, _) = ingress_room
+                .add_peer(bob_hex.clone(), 2)
+                .expect("F7a-cross-pod: add bob to ingress room");
+
+            // Owner-pod roster: Alice (already live) + Bob (just registered on owner).
+            // This is what RegisterPeer returns — the authoritative roster.
+            let alice_hex = alice_key.public_key().to_hex();
+            let owner_snapshot = crate::audio::join::RosterSnapshot {
+                revision: 5,
+                peers: vec![
+                    crate::audio::join::RosterEntry {
+                        pubkey: alice_hex.clone(),
+                        peer_index: 0,
+                        epoch: 3,
+                    },
+                    crate::audio::join::RosterEntry {
+                        pubkey: bob_hex.clone(),
+                        peer_index: bob_index,
+                        epoch: bob_epoch,
+                    },
+                ],
+            };
+
+            let deadline = Utc::now() + Duration::hours(1);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel);
+
+            let result = commit_participant_join(
+                &state,
+                &tenant,
+                channel_id,
+                channel_id,
+                &bob_hex,
+                &bob_bytes,
+                bob_id,
+                bob_index,
+                bob_epoch,
+                1,
+                "1",
+                &MembershipAdmission::Existing {
+                    parent_channel_id: channel_id,
+                },
+                &gate,
+                &ingress_room,
+                Some(&owner_snapshot), // cross-pod: use owner-pod roster for the broadcast
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "F7a-cross-pod: commit_participant_join must succeed; got {result:?}"
+            );
+
+            // The listener receives the joined broadcast.
+            let ctrl_msg = listener_ctrl_rx
+                .try_recv()
+                .expect("F7a-cross-pod: listener must receive a `joined` broadcast after bob joins");
+            let msg = match ctrl_msg {
+                crate::audio::room::PeerCtrl::Json(s) => s,
+                crate::audio::room::PeerCtrl::Close => {
+                    panic!("F7a-cross-pod: expected Json ctrl message, got Close")
+                }
+            };
+            let parsed: serde_json::Value =
+                serde_json::from_str(&msg).expect("F7a-cross-pod: joined broadcast must be valid JSON");
+
+            let peers_array = parsed["peers"]
+                .as_array()
+                .expect("F7a-cross-pod: joined broadcast must have peers[] array");
+            let peers_pubkeys: Vec<&str> = peers_array
+                .iter()
+                .filter_map(|p| p["pubkey"].as_str())
+                .collect();
+
+            // Bob (the joiner) must be present.
+            assert!(
+                peers_pubkeys.contains(&bob_hex.as_str()),
+                "F7a-cross-pod: joined peers[] must include the joining peer (bob); \
+                 got peers={peers_pubkeys:?}"
+            );
+            // Alice (owner-pod peer, in owner_snapshot but NOT in ingress room) must appear.
+            assert!(
+                peers_pubkeys.contains(&alice_hex.as_str()),
+                "F7a-cross-pod: joined peers[] must include alice from the owner roster; \
+                 got peers={peers_pubkeys:?}\n\
+                 Mutation oracle: pass None as owner_roster → ingress-local room snapshot \
+                 used → alice absent → this assertion panics"
+            );
+            // Revision must come from the owner roster (5), not the ingress room.
+            assert_eq!(
+                parsed["revision"].as_u64(),
+                Some(5),
+                "F7a-cross-pod: joined revision must match owner roster revision (5); \
+                 got {parsed:?}"
             );
         }
 
@@ -7157,6 +7562,677 @@ mod tests {
                  Mutation oracle B: pass 0 instead of owner_generation to release → \
                  generation fence rejects → entry still present → panics"
             );
+        }
+
+        // ── F4b relay-membership denial wire frame ────────────────────────────
+        //
+        // When `require_relay_membership = true` and the connecting pubkey is NOT
+        // in `relay_members`, `enforce_relay_membership` returns `Denied`.
+        // The handler must send `{"type":"restricted","message":"restricted:
+        // authorization denied"}` — byte-exact via `authorization_denied_frame(Audio)`.
+        //
+        // ## Mutation oracle
+        //
+        // Change the FI-present branch to send any other frame (e.g. the legacy
+        // `{"type":"error","message":"restricted: not a relay member"}`) → the
+        // `assert_eq!` below panics.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn fix_4b_relay_membership_denial_with_fi_emits_restricted_wire_frame() {
+            use axum::extract::ws::WebSocketUpgrade;
+            use axum::routing::get;
+            use axum::Router;
+            use buzz_auth::VerifiedAssertion;
+            use chrono::{Duration, Utc};
+            use std::sync::Arc;
+            use tokio::net::TcpListener;
+            use tokio_tungstenite::connect_async;
+            use uuid::Uuid;
+
+            // Build state with require_relay_membership = true.
+            let db_url = crate::test_support::database_url();
+            let pool = sqlx::PgPool::connect(&db_url)
+                .await
+                .expect("F4b-relay: PostgreSQL must be available");
+            let mut config = crate::config::Config::for_test();
+            config.require_relay_membership = true;
+            config.database_url = db_url.clone();
+            config.redis_url = "redis://127.0.0.1:1".to_string();
+            let db = buzz_db::Db::from_pool(pool.clone());
+            let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .expect("redis pool");
+            let pubsub = Arc::new(
+                buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                    .await
+                    .expect("pubsub"),
+            );
+            let audit = buzz_audit::AuditService::new(pool.clone());
+            let auth = buzz_auth::AuthService::new(config.auth.clone());
+            let search = buzz_search::SearchService::new(pool.clone());
+            let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+                db.clone(),
+                buzz_workflow::WorkflowConfig::default(),
+            ));
+            let media_storage =
+                buzz_media::MediaStorage::new(&config.media).expect("media storage");
+            let (state, _audit_shutdown) = crate::state::AppState::new(
+                config,
+                db,
+                redis_pool,
+                audit,
+                pubsub,
+                auth,
+                search,
+                workflow_engine,
+                nostr::Keys::generate(),
+                media_storage,
+            );
+            let state = Arc::new(state);
+
+            // Seed a community — the key is NOT in relay_members.
+            let community_uuid = Uuid::new_v4();
+            let host = format!("f4b-relay-{}.example", community_uuid.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community_uuid)
+                .bind(&host)
+                .execute(&pool)
+                .await
+                .expect("F4b-relay: seed community");
+            let tenant = buzz_core::tenant::TenantContext::resolved(
+                buzz_core::tenant::CommunityId::from_uuid(community_uuid),
+                host.clone(),
+            );
+
+            // Key assertion — same key will be used for NIP-42, so pairing passes.
+            let key = nostr::Keys::generate();
+            let assertion = VerifiedAssertion::for_test(
+                Some(key.public_key()),
+                vec![Utc::now() + Duration::hours(1)],
+            );
+
+            let channel_id = Uuid::new_v4();
+            let state_c = Arc::clone(&state);
+            let tenant_c = tenant.clone();
+            let assertion_c = assertion.clone();
+
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            let addr = listener.local_addr().expect("addr");
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+            let server = tokio::spawn(async move {
+                let app = Router::new().route(
+                    "/",
+                    get({
+                        let state_i = Arc::clone(&state_c);
+                        let tenant_i = tenant_c.clone();
+                        let assertion_i = assertion_c.clone();
+                        move |ws: WebSocketUpgrade| {
+                            let state_i = Arc::clone(&state_i);
+                            let tenant_i = tenant_i.clone();
+                            let assertion_i = assertion_i.clone();
+                            let conn_time = chrono::Utc::now();
+                            let cancel_i = tokio_util::sync::CancellationToken::new();
+                            let control_inner =
+                                crate::state::CommunityConnectionControl::new(cancel_i);
+                            async move {
+                                ws.on_upgrade(move |socket| async move {
+                                    handle_active_audio_connection(
+                                        socket,
+                                        state_i,
+                                        tenant_i,
+                                        channel_id,
+                                        control_inner,
+                                        Some(assertion_i),
+                                        conn_time,
+                                        None,
+                                    )
+                                    .await
+                                })
+                            }
+                        }
+                    }),
+                );
+                let _ = ready_tx.send(());
+                axum::serve(listener, app).await.expect("test server");
+            });
+
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+                .await
+                .expect("server ready");
+
+            let (mut client, _) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("connect");
+
+            // Receive challenge.
+            let challenge_msg =
+                tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+                    .await
+                    .expect("challenge timeout")
+                    .expect("challenge msg")
+                    .expect("ws msg");
+            let challenge_text = match challenge_msg {
+                tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+                other => panic!("F4b-relay: expected challenge text; got {other:?}"),
+            };
+            let challenge_json: serde_json::Value =
+                serde_json::from_str(&challenge_text).expect("challenge JSON");
+            let challenge = challenge_json["challenge"]
+                .as_str()
+                .expect("challenge field")
+                .to_string();
+
+            // Send auth with the MATCHING key (pairing passes) + relay URL for this tenant.
+            let relay_url = format!("ws://{host}");
+            let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+                .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
+                .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+                .sign_with_keys(&key)
+                .unwrap();
+            let auth_msg = serde_json::json!({"type": "auth", "event": auth_event}).to_string();
+            client
+                .send(tokio_tungstenite::tungstenite::Message::Text(auth_msg.into()))
+                .await
+                .expect("send auth");
+
+            // The relay-membership gate fires: must receive the exact restricted frame.
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                .await
+                .expect("restricted frame timeout")
+                .expect("frame present")
+                .expect("ws frame");
+
+            let expected = serde_json::json!({
+                "type": "restricted",
+                "message": buzz_auth::DenialClass::AuthorizationDenied.nostr_text()
+            })
+            .to_string();
+
+            match frame {
+                tokio_tungstenite::tungstenite::Message::Text(t) => {
+                    assert_eq!(
+                        t.as_str(),
+                        expected.as_str(),
+                        "F4b-relay: relay-membership denial with FI must produce exact restricted JSON\n\
+                         Mutation oracle: revert FI branch to use legacy error text → this asserts panics"
+                    );
+                }
+                other => panic!("F4b-relay: expected Text(restricted JSON); got {other:?}"),
+            }
+
+            server.abort();
+            let _ = server.await;
+        }
+
+        // ── F4b channel-membership denial wire frame ──────────────────────────
+        //
+        // When the pubkey is NOT a member of a private channel and no
+        // auto-add path is available, `check_membership_for_admission` returns
+        // `Err("not a member")`. With an FI assertion present the handler must
+        // send `{"type":"restricted","message":"restricted: authorization denied"}`.
+        //
+        // ## Mutation oracle
+        //
+        // Change the FI-present branch to send the legacy `{"type":"error",
+        // "message":"not a member"}` frame → the `assert_eq!` below panics.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn fix_4b_channel_membership_denial_with_fi_emits_restricted_wire_frame() {
+            use axum::extract::ws::WebSocketUpgrade;
+            use axum::routing::get;
+            use axum::Router;
+            use buzz_auth::VerifiedAssertion;
+            use chrono::{Duration, Utc};
+            use std::sync::Arc;
+            use tokio::net::TcpListener;
+            use tokio_tungstenite::connect_async;
+            use uuid::Uuid;
+
+            let state = audio_test_state_real_db()
+                .await
+                .expect("F4b-channel: PostgreSQL must be available");
+            let pool = state.db.pool().clone();
+
+            // Seed: community + private channel (visibility='private'). The test
+            // key has NO membership row — triggers "not a member" denial.
+            let community_uuid = Uuid::new_v4();
+            let host = format!("f4b-ch-{}.example", community_uuid.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community_uuid)
+                .bind(&host)
+                .execute(&pool)
+                .await
+                .expect("F4b-channel: seed community");
+
+            let channel_id = Uuid::new_v4();
+            let creator = nostr::Keys::generate();
+            let creator_bytes = creator.public_key().to_bytes().to_vec();
+            // Private channel — key not in members → "not a member" error.
+            sqlx::query(
+                "INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by) \
+                 VALUES ($1, $2, 'f4b-ch-private', 'stream', 'private', $3)",
+            )
+            .bind(channel_id)
+            .bind(community_uuid)
+            .bind(&creator_bytes)
+            .execute(&pool)
+            .await
+            .expect("F4b-channel: seed channel");
+
+            let tenant = buzz_core::tenant::TenantContext::resolved(
+                buzz_core::tenant::CommunityId::from_uuid(community_uuid),
+                host.clone(),
+            );
+
+            let key = nostr::Keys::generate();
+            let assertion = VerifiedAssertion::for_test(
+                Some(key.public_key()),
+                vec![Utc::now() + Duration::hours(1)],
+            );
+
+            let state_c = Arc::clone(&state);
+            let tenant_c = tenant.clone();
+            let assertion_c = assertion.clone();
+
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            let addr = listener.local_addr().expect("addr");
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+            let server = tokio::spawn(async move {
+                let app = Router::new().route(
+                    "/",
+                    get({
+                        let state_i = Arc::clone(&state_c);
+                        let tenant_i = tenant_c.clone();
+                        let assertion_i = assertion_c.clone();
+                        move |ws: WebSocketUpgrade| {
+                            let state_i = Arc::clone(&state_i);
+                            let tenant_i = tenant_i.clone();
+                            let assertion_i = assertion_i.clone();
+                            let conn_time = chrono::Utc::now();
+                            let cancel_i = tokio_util::sync::CancellationToken::new();
+                            let control_inner =
+                                crate::state::CommunityConnectionControl::new(cancel_i);
+                            async move {
+                                ws.on_upgrade(move |socket| async move {
+                                    handle_active_audio_connection(
+                                        socket,
+                                        state_i,
+                                        tenant_i,
+                                        channel_id,
+                                        control_inner,
+                                        Some(assertion_i),
+                                        conn_time,
+                                        None,
+                                    )
+                                    .await
+                                })
+                            }
+                        }
+                    }),
+                );
+                let _ = ready_tx.send(());
+                axum::serve(listener, app).await.expect("test server");
+            });
+
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+                .await
+                .expect("server ready");
+
+            let (mut client, _) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("connect");
+
+            // Receive challenge.
+            let challenge_msg =
+                tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+                    .await
+                    .expect("challenge timeout")
+                    .expect("challenge msg")
+                    .expect("ws msg");
+            let challenge_text = match challenge_msg {
+                tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+                other => panic!("F4b-channel: expected challenge text; got {other:?}"),
+            };
+            let challenge_json: serde_json::Value =
+                serde_json::from_str(&challenge_text).expect("challenge JSON");
+            let challenge = challenge_json["challenge"]
+                .as_str()
+                .expect("challenge field")
+                .to_string();
+
+            let relay_url = format!("ws://{host}");
+            let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+                .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
+                .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+                .sign_with_keys(&key)
+                .unwrap();
+            let auth_msg = serde_json::json!({"type": "auth", "event": auth_event}).to_string();
+            client
+                .send(tokio_tungstenite::tungstenite::Message::Text(auth_msg.into()))
+                .await
+                .expect("send auth");
+
+            // Channel-membership gate fires: must receive the exact restricted frame.
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                .await
+                .expect("restricted frame timeout")
+                .expect("frame present")
+                .expect("ws frame");
+
+            let expected = serde_json::json!({
+                "type": "restricted",
+                "message": buzz_auth::DenialClass::AuthorizationDenied.nostr_text()
+            })
+            .to_string();
+
+            match frame {
+                tokio_tungstenite::tungstenite::Message::Text(t) => {
+                    assert_eq!(
+                        t.as_str(),
+                        expected.as_str(),
+                        "F4b-channel: channel-membership denial with FI must produce exact restricted JSON\n\
+                         Mutation oracle: revert FI branch to use legacy error text → this asserts panics"
+                    );
+                }
+                other => panic!("F4b-channel: expected Text(restricted JSON); got {other:?}"),
+            }
+
+            server.abort();
+            let _ = server.await;
+        }
+
+        // ── F4b ParentMembershipLost transactional denial wire frame ──────────
+        //
+        // When `commit_participant_join` detects that the parent membership was
+        // revoked between `check_membership_for_admission` and the transaction
+        // lock, it returns `JoinCommitError::ParentMembershipLost`. With an FI
+        // assertion present the handler sends the exact canonical restricted frame
+        // via `ws_send` (not the ordinary control or terminal channels).
+        //
+        // Schedule:
+        //   1. Ephemeral child channel with a huddle_started link; parent channel
+        //      has the joiner as a member → `check_membership_for_admission`
+        //      returns `AutoAddRequired`.
+        //   2. `handle_active_audio_connection` proceeds to `commit_participant_join`.
+        //   3. `audio_membership_lock_hook` pauses execution just before the
+        //      membership-lock acquisition inside the joint transaction.
+        //   4. While paused: DELETE the parent membership row externally.
+        //   5. Release the hook. `is_member_in_transaction(parent_channel_id)`
+        //      returns false → `ParentMembershipLost`.
+        //   6. The handler sends `{"type":"restricted",...}` via `ws_send`.
+        //
+        // ## Mutation oracle
+        //
+        // Change the `ParentMembershipLost` FI branch to send the legacy
+        // `{"type":"error","message":"error: not a member"}` frame → the
+        // `assert_eq!` below panics.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn fix_4b_parent_membership_lost_with_fi_emits_restricted_wire_frame() {
+            use axum::extract::ws::WebSocketUpgrade;
+            use axum::routing::get;
+            use axum::Router;
+            use buzz_auth::VerifiedAssertion;
+            use chrono::{Duration, Utc};
+            use std::sync::Arc;
+            use tokio::net::TcpListener;
+            use tokio_tungstenite::connect_async;
+            use uuid::Uuid;
+
+            let state = audio_test_state_real_db()
+                .await
+                .expect("F4b-pml: PostgreSQL must be available");
+            let pool = state.db.pool().clone();
+
+            let community_uuid = Uuid::new_v4();
+            let host = format!("f4b-pml-{}.example", community_uuid.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community_uuid)
+                .bind(&host)
+                .execute(&pool)
+                .await
+                .expect("F4b-pml: seed community");
+
+            let creator = nostr::Keys::generate();
+            let creator_bytes = creator.public_key().to_bytes().to_vec();
+
+            // Parent channel (non-ephemeral, open). The joiner will be seeded as a
+            // member here so check_membership_for_admission returns AutoAddRequired.
+            let parent_channel_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by) \
+                 VALUES ($1, $2, 'f4b-pml-parent', 'stream', 'open', $3)",
+            )
+            .bind(parent_channel_id)
+            .bind(community_uuid)
+            .bind(&creator_bytes)
+            .execute(&pool)
+            .await
+            .expect("F4b-pml: seed parent channel");
+
+            // Child channel — ephemeral (ttl_seconds set) so AutoAddRequired fires.
+            // Private to ensure the "not already a member" branch is taken.
+            let child_channel_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO channels \
+                 (id, community_id, name, channel_type, visibility, created_by, ttl_seconds) \
+                 VALUES ($1, $2, 'f4b-pml-child', 'stream', 'private', $3, 3600)",
+            )
+            .bind(child_channel_id)
+            .bind(community_uuid)
+            .bind(&creator_bytes)
+            .execute(&pool)
+            .await
+            .expect("F4b-pml: seed child channel");
+
+            // Seed the huddle_started link (kind 48100) linking parent → child.
+            let huddle_link_content =
+                serde_json::json!({ "ephemeral_channel_id": child_channel_id.to_string() })
+                    .to_string();
+            sqlx::query(
+                "INSERT INTO events \
+                 (community_id, id, pubkey, created_at, kind, tags, content, sig, channel_id) \
+                 VALUES ($1, $2, $3, NOW(), $4, '[]', $5, $6, $7)",
+            )
+            .bind(community_uuid)
+            .bind(vec![0xCCu8; 32])
+            .bind(&creator_bytes)
+            .bind(48100_i32)
+            .bind(&huddle_link_content)
+            .bind(vec![0u8; 64])
+            .bind(parent_channel_id)
+            .execute(&pool)
+            .await
+            .expect("F4b-pml: seed huddle_started link");
+
+            // Seed the joiner as a parent-channel member so AutoAddRequired fires.
+            let joiner_key = nostr::Keys::generate();
+            let joiner_bytes = joiner_key.public_key().to_bytes().to_vec();
+            sqlx::query(
+                "INSERT INTO channel_members \
+                 (channel_id, community_id, pubkey, role, invited_by) \
+                 VALUES ($1, $2, $3, 'member', $4)",
+            )
+            .bind(parent_channel_id)
+            .bind(community_uuid)
+            .bind(&joiner_bytes)
+            .bind(&creator_bytes)
+            .execute(&pool)
+            .await
+            .expect("F4b-pml: seed parent membership");
+
+            let community_id = buzz_core::tenant::CommunityId::from_uuid(community_uuid);
+            let tenant = buzz_core::tenant::TenantContext::resolved(community_id, host.clone());
+
+            let assertion = VerifiedAssertion::for_test(
+                Some(joiner_key.public_key()),
+                vec![Utc::now() + Duration::hours(1)],
+            );
+
+            // Arm the membership-lock hook BEFORE the server starts. The hook fires
+            // inside commit_participant_join just before the membership-lock acquisition.
+            let (arrived_rx, release) =
+                crate::nip_fi_test_hooks::audio_membership_lock_hook::arm(community_id);
+
+            let state_c = Arc::clone(&state);
+            let tenant_c = tenant.clone();
+            let assertion_c = assertion.clone();
+            let pool_c = pool.clone();
+
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            let addr = listener.local_addr().expect("addr");
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+            let server = tokio::spawn(async move {
+                let app = Router::new().route(
+                    "/",
+                    get({
+                        let state_i = Arc::clone(&state_c);
+                        let tenant_i = tenant_c.clone();
+                        let assertion_i = assertion_c.clone();
+                        // The handler targets the CHILD channel; `parent_channel_id` is
+                        // passed via the auth message's `parent_channel_id` field, which
+                        // is parsed in `handle_active_audio_connection`. We pass it
+                        // as `channel_id` in the outer call; the handler determines
+                        // the parent from the DB (ttl_seconds triggers the parent path).
+                        move |ws: WebSocketUpgrade| {
+                            let state_i = Arc::clone(&state_i);
+                            let tenant_i = tenant_i.clone();
+                            let assertion_i = assertion_i.clone();
+                            let conn_time = chrono::Utc::now();
+                            let cancel_i = tokio_util::sync::CancellationToken::new();
+                            let control_inner =
+                                crate::state::CommunityConnectionControl::new(cancel_i);
+                            async move {
+                                ws.on_upgrade(move |socket| async move {
+                                    handle_active_audio_connection(
+                                        socket,
+                                        state_i,
+                                        tenant_i,
+                                        child_channel_id,
+                                        control_inner,
+                                        Some(assertion_i),
+                                        conn_time,
+                                        None,
+                                    )
+                                    .await
+                                })
+                            }
+                        }
+                    }),
+                );
+                let _ = ready_tx.send(());
+                axum::serve(listener, app).await.expect("test server");
+            });
+
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+                .await
+                .expect("server ready");
+
+            let (mut client, _) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("connect");
+
+            // Receive challenge.
+            let challenge_msg =
+                tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+                    .await
+                    .expect("challenge timeout")
+                    .expect("challenge msg")
+                    .expect("ws msg");
+            let challenge_text = match challenge_msg {
+                tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+                other => panic!("F4b-pml: expected challenge text; got {other:?}"),
+            };
+            let challenge_json: serde_json::Value =
+                serde_json::from_str(&challenge_text).expect("challenge JSON");
+            let challenge = challenge_json["challenge"]
+                .as_str()
+                .expect("challenge field")
+                .to_string();
+
+            // Send auth with matching key + parent_channel_id in the auth message.
+            // The handler reads `parent_channel_id` from the auth message to supply
+            // to check_membership_for_admission, which uses it to verify the huddle link.
+            let relay_url = format!("ws://{host}");
+            let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+                .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
+                .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+                .sign_with_keys(&joiner_key)
+                .unwrap();
+            let auth_msg = serde_json::json!({
+                "type": "auth",
+                "event": auth_event,
+                "parent_channel_id": parent_channel_id,
+            })
+            .to_string();
+            client
+                .send(tokio_tungstenite::tungstenite::Message::Text(auth_msg.into()))
+                .await
+                .expect("send auth");
+
+            // Wait for the handler to reach the membership-lock hook inside
+            // commit_participant_join. The handler successfully passes: auth,
+            // pairing, relay-membership (disabled), channel-membership check
+            // (AutoAddRequired), add_peer, and enters commit_participant_join.
+            tokio::time::timeout(std::time::Duration::from_secs(10), arrived_rx)
+                .await
+                .expect("F4b-pml: must reach membership_lock_hook within 10s")
+                .expect("arrived channel closed");
+
+            // While the handler is paused inside the transaction (before the lock
+            // is acquired), delete the parent membership row. The re-read inside
+            // the transaction will find no parent member → ParentMembershipLost.
+            sqlx::query(
+                "DELETE FROM channel_members \
+                 WHERE channel_id = $1 AND community_id = $2 AND pubkey = $3",
+            )
+            .bind(parent_channel_id)
+            .bind(community_uuid)
+            .bind(&joiner_bytes)
+            .execute(&pool_c)
+            .await
+            .expect("F4b-pml: delete parent membership");
+
+            // Release the hook — the transaction proceeds, finds no parent member,
+            // and the handler sends the FI denial frame.
+            release.notify_one();
+
+            // Must receive the exact restricted frame.
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                .await
+                .expect("restricted frame timeout")
+                .expect("frame present")
+                .expect("ws frame");
+
+            let expected = serde_json::json!({
+                "type": "restricted",
+                "message": buzz_auth::DenialClass::AuthorizationDenied.nostr_text()
+            })
+            .to_string();
+
+            match frame {
+                tokio_tungstenite::tungstenite::Message::Text(t) => {
+                    assert_eq!(
+                        t.as_str(),
+                        expected.as_str(),
+                        "F4b-pml: ParentMembershipLost with FI must produce exact restricted JSON\n\
+                         Mutation oracle: revert ParentMembershipLost FI branch to legacy error → panics"
+                    );
+                }
+                other => panic!("F4b-pml: expected Text(restricted JSON); got {other:?}"),
+            }
+
+            server.abort();
+            let _ = server.await;
         }
     }
 }

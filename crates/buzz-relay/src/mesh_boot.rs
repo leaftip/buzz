@@ -195,87 +195,6 @@ impl MeshHandle {
             shutting_down,
         )
     }
-
-    /// Construct a minimal `MeshHandle` for unit tests.
-    ///
-    /// Binds a throwaway loopback QUIC endpoint (127.0.0.1:0) and starts the
-    /// mesh loops. The loops will be idle — no peers are seeded, and the
-    /// handle's channels are not wired for production traffic.
-    ///
-    /// The `owners` registry is the test's control point: install entries
-    /// before running the handler and assert their state afterward. All other
-    /// fields (directory, transport, dispatcher, audio_fence) use no-op or
-    /// disconnected stubs.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the loopback bind fails. This should not happen in any normal
-    /// test environment.
-    #[cfg(test)]
-    pub fn for_tests(owners: Arc<crate::audio::join::HuddleOwnerRegistry>) -> Self {
-        use buzz_relay_mesh::gossip::GossipRecord;
-        use buzz_relay_mesh::membership::MeshMembership;
-        use buzz_relay_mesh::RuntimeId;
-
-        // Bind a loopback endpoint for the MeshRuntime — required by the
-        // constructor but never dialled in tests.
-        let endpoint = tokio::runtime::Handle::current()
-            .block_on(buzz_relay_mesh::endpoint::MeshEndpoint::bind(
-                "127.0.0.1:0".parse().expect("loopback addr"),
-            ))
-            .expect("MeshHandle::for_tests: failed to bind loopback mesh endpoint");
-        let runtime_id = endpoint.runtime_id();
-        let record = GossipRecord::new(runtime_id, vec![], 1);
-        let membership = MeshMembership::new(record);
-        let runtime = buzz_relay_mesh::MeshRuntime::start(endpoint, membership, None);
-
-        let pool = deadpool_redis::Config::from_url("redis://127.0.0.1:1") // never dialled
-            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .expect("deadpool-redis pool");
-
-        struct NoopTransport;
-        impl buzz_relay_mesh::RelayPeerTransport for NoopTransport {
-            fn send_datagram(
-                &self,
-                _to: RuntimeId,
-                _dgram: buzz_relay_mesh::MeshDatagram,
-            ) -> Result<(), buzz_relay_mesh::MeshError> {
-                Ok(())
-            }
-            fn open_session_stream(
-                &self,
-                _to: RuntimeId,
-                _hello: buzz_relay_mesh::StreamHello,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = Result<
-                                buzz_relay_mesh::MeshStream,
-                                buzz_relay_mesh::MeshError,
-                            >,
-                        > + Send
-                        + '_,
-                >,
-            > {
-                Box::pin(async { Err(buzz_relay_mesh::MeshError::Transport("unused".into())) })
-            }
-            fn set_inbound(&self, _handler: Box<dyn buzz_relay_mesh::InboundHandler>) {}
-        }
-
-        let no_relay_pubkey_anchored = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let _ = no_relay_pubkey_anchored; // used only to satisfy struct field
-
-        MeshHandle {
-            directory: crate::tunnel::directory::SessionDirectory::new(pool),
-            transport: Arc::new(NoopTransport),
-            membership: Arc::new(runtime.membership().clone()),
-            local_runtime_id: runtime_id,
-            dispatcher: MeshInboundDispatcher::default(),
-            audio_fence: Arc::new(crate::audio::mesh::GenerationFloor::new()),
-            runtime,
-            owners,
-        }
-    }
 }
 
 /// Wire the three inbound mesh lanes to their consumers.
@@ -611,7 +530,7 @@ mod tests {
     /// ever reached Redis this test would hang/fail.
     #[tokio::test]
     async fn mesh_off_boots_nothing() {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        let mut config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
         config.mesh.enabled = false;
         let pool = deadpool_redis::Config::from_url("redis://127.0.0.1:1") // unroutable
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
@@ -638,7 +557,7 @@ mod tests {
         if std::env::var("BUZZ_MESH").is_ok() {
             return; // externally forced — skip rather than assert a lie
         }
-        let config = crate::config::Config::from_env().expect("default config loads");
+        let config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
         assert!(!config.mesh.enabled, "BUZZ_MESH absent must mean mesh off");
     }
 
