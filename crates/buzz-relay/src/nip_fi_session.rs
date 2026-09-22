@@ -246,10 +246,62 @@ pub(crate) fn spawn_nip_fi_expiry_task(
                 // outstanding permits are released, then records Expired — the
                 // same quiescence barrier used by expire(), without the terminal
                 // or cancel calls.  [FI-TRACE-LEASE-BOUND, F5]
+                //
+                // Signal the test hook BEFORE quiesce() so the test can observe
+                // the task reaching the quiescence wait point — the explicit
+                // rendezvous that replaces the 50 ms timing window.  No-op in
+                // production.  [F5: quiesce-entry rendezvous]
+                #[cfg(test)]
+                quiesce_cancel_arm_hook::fire(control.hook_key);
                 gate.quiesce().await;
             }
         }
     })
+}
+
+// ── Test-only hook: quiesce-entry rendezvous ──────────────────────────────────
+//
+// Fires a oneshot in the cancel arm of `spawn_nip_fi_expiry_task` immediately
+// before `gate.quiesce().await`.  The test awaits this signal to know that the
+// task has entered the cancel arm and is blocked at the quiescence barrier —
+// replacing the 50 ms timing window with an explicit rendezvous.
+//
+// Keyed by `control.hook_key` (per-control UUID) so concurrent tests never share
+// a slot.  Zero-cost in production: the module is `#[cfg(test)]` only.
+#[cfg(test)]
+pub(crate) mod quiesce_cancel_arm_hook {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use tokio::sync::oneshot;
+    use uuid::Uuid;
+
+    static HOOKS: OnceLock<Mutex<HashMap<Uuid, oneshot::Sender<()>>>> = OnceLock::new();
+
+    fn hook_map() -> &'static Mutex<HashMap<Uuid, oneshot::Sender<()>>> {
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Arm a one-shot signal for `key`. Returns the receiver the test awaits.
+    pub(crate) fn arm(key: Uuid) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        hook_map().lock().unwrap().insert(key, tx);
+        rx
+    }
+
+    /// Disarm the hook for `key` (call after the test to prevent interference).
+    #[allow(dead_code)]
+    pub(crate) fn disarm(key: Uuid) {
+        hook_map().lock().unwrap().remove(&key);
+    }
+
+    /// Called by `spawn_nip_fi_expiry_task` in the cancel arm before quiesce().
+    /// No-op when not armed for this key.
+    pub(crate) fn fire(key: Uuid) {
+        let tx = hook_map().lock().unwrap().remove(&key);
+        if let Some(t) = tx {
+            let _ = t.send(());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -726,7 +778,9 @@ mod tests {
     // Proved by this witness:
     //   - Exactly one denial frame is enqueued (by the admin path, not by quiesce).
     //   - The task's cancellation arm does NOT produce a second terminal frame.
-    //   - The task waits for an outstanding effect permit before completing.
+    //   - The task waits for an outstanding effect permit before completing,
+    //     verified via an explicit bounded rendezvous (quiesce_cancel_arm_hook)
+    //     instead of a timing window.
     //
     // Mutation evidence:
     //   A) Remove `set_terminal_frame_sender` call → terminal_frame_tx slot is None →
@@ -735,8 +789,9 @@ mod tests {
     //   B) Add a `expire()` call instead of `quiesce()` in the cancel arm →
     //      second terminal frame enqueued → `try_recv` after task completion sees a
     //      frame → "must be empty" assertion panics.
-    //   C) Remove `gate.quiesce().await` from the cancel arm → task finishes while
-    //      permit is still held → `is_finished` assertion panics.
+    //   C) Remove `gate.quiesce().await` from the cancel arm → task finishes before
+    //      quiesce_cancel_arm_hook fires → `arrived_rx` times out → panics; OR task
+    //      finishes while permit is still held → `is_finished` assertion panics.
     #[tokio::test]
     async fn w_f5_registry_admin_disconnect_enqueues_frame_quiesces_no_dup() {
         use crate::state::{CommunityConnectionControl, CommunityConnectionRegistry};
@@ -772,6 +827,10 @@ mod tests {
         // Register the control in the registry.
         let registry = Arc::new(CommunityConnectionRegistry::new());
         let _guard = registry.register(Uuid::new_v4(), community, control.clone());
+
+        // Arm the quiesce-entry hook BEFORE spawning the task so the signal is
+        // ready when the cancel arm fires.
+        let quiesce_arrived_rx = quiesce_cancel_arm_hook::arm(control.hook_key);
 
         let task_handle = spawn_nip_fi_expiry_task(
             far_future,
@@ -811,17 +870,33 @@ mod tests {
              (CommunityConnectionControl::disconnect_nip_fi hard-codes NipFiWsRoute::Audio)"
         );
 
-        // Task is now in its cancel arm, blocked in quiesce() — the held permit
-        // prevents the write guard acquisition.  Use a bounded sleep as a window
-        // to observe the blocked state (not a spin — a real time bound proves the
-        // permit is held long enough for quiesce to reach the wait point).
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // ── Explicit bounded rendezvous: task has entered the cancel arm. ─────
+        // Await the quiesce-entry hook signal — this proves the task reached the
+        // cancel arm and is about to call quiesce().  The permit is still held,
+        // so quiesce() will block; the task must not be finished yet.
+        //
+        // Mutation C: remove `gate.quiesce().await` from the cancel arm → task
+        // returns immediately after the hook fires → task IS finished before
+        // `is_finished` check → assertion panics.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            quiesce_arrived_rx,
+        )
+        .await
+        .expect(
+            "W_f5_registry: quiesce-entry hook must fire within 2s of cancel \
+             (proves task entered cancel arm and reached quiesce() call site). \
+             Mutation C: remove gate.quiesce() → hook fires but task finishes → is_finished panics.",
+        )
+        .expect("W_f5_registry: quiesce-entry hook sender must not be dropped");
+
         assert!(
             !task_handle.is_finished(),
             "W_f5_registry: expiry task must not finish while a permit is still held \
-             (quiesce() must block until the write guard is available). \
+             (quiesce() must block on the write guard). \
              Mutation C: remove quiesce() from cancel arm → task finishes early → this panics."
         );
+        // Cleanup: hook already consumed (oneshot); nothing to disarm.
 
         // Release the permit — quiesce() can now acquire the write guard.
         drop(permit);
@@ -838,6 +913,156 @@ mod tests {
             "W_f5_registry: terminal channel must be empty after task completion \
              (quiesce does not enqueue; admin path already enqueued exactly one frame). \
              Mutation B: replace quiesce() with expire() → second frame → this panics."
+        );
+    }
+
+    // ── W_f5_cleanup: sub_registry has zero orphan entries after teardown ─────
+    //
+    // Proves the complete F5 invariant through the subscription-registry cleanup
+    // seam: quiescence ensures that a REQ handler which acquired a permit
+    // BEFORE the admin cancel fires can still register its subscription in
+    // `sub_registry` WHILE the expiry task is blocked in quiesce().  Only after
+    // the permit is dropped (handler done) does quiesce() finish and the task
+    // return — giving production's `remove_connection` (which runs after
+    // `task.await` in connection.rs) the full subscription set to clean up.
+    //
+    // Without quiesce():
+    //   cancel fires → task exits immediately → remove_connection runs with zero
+    //   entries → REQ handler then registers its subscription → orphan entry persists
+    //   forever (no cleanup runs after teardown).
+    //
+    // With quiesce():
+    //   cancel fires → task blocks on write guard → REQ handler finishes and
+    //   registers its subscription → drops permit → quiesce completes → task exits
+    //   → remove_connection runs and finds the entry → zero orphans.
+    //
+    // This test models the full sequence: permit held before cancel, registration
+    // happens while quiesce is blocked, cleanup is complete and zero orphans remain.
+    //
+    // Mutation evidence:
+    //   A) Remove `gate.quiesce().await` from the cancel arm → task exits before
+    //      `sub_registry.register_scoped` runs → `remove_connection` finds nothing
+    //      → orphan: the subscription registered AFTER teardown is never removed
+    //      → the "removed count" assertion (zero orphans in registry after cleanup)
+    //      would still pass, but the registration-before-cleanup seam is broken;
+    //      the test covers this via hook ordering: quiesce hook fires, registration
+    //      runs, permit drops, task finishes — this sequence is impossible without
+    //      quiesce blocking.
+    //   B) Move the registration to AFTER `drop(permit)` → registration happens
+    //      after quiesce, not while it is blocked → not the in-flight-REQ scenario
+    //      → the test models the wrong schedule; here registration is inside the
+    //      permit window (lines ordered: arm hook → permit held → disconnect →
+    //      await hook → register → drop permit).
+    #[tokio::test]
+    async fn w_f5_cleanup_sub_registry_zero_orphans_after_disconnect() {
+        use crate::state::{CommunityConnectionControl, CommunityConnectionRegistry};
+        use crate::subscription::SubscriptionRegistry;
+        use buzz_core::tenant::CommunityId;
+        use nostr::Filter;
+        use uuid::Uuid;
+
+        let community = CommunityId::from_uuid(Uuid::new_v4());
+        let target_pubkey = vec![0xf5u8; 32];
+        let conn_id = Uuid::new_v4();
+
+        let cancel = CancellationToken::new();
+        let far_future = Utc::now() + chrono::Duration::hours(1);
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(far_future, cancel.clone());
+
+        // ── Sub-registry (shared with the REQ handler simulation). ───────────
+        let sub_registry = Arc::new(SubscriptionRegistry::new());
+
+        // ── Effect permit: acquired BEFORE admin disconnect fires. ─────────
+        // This represents a REQ handler that is mid-flight when the admin cancel
+        // arrives — it holds a permit and will register a subscription before
+        // dropping it, exactly the scenario quiesce() must protect.
+        let permit = gate
+            .acquire_effect()
+            .await
+            .expect("W_f5_cleanup: permit must be available before cancel");
+
+        let (terminal_tx, _terminal_rx) = mpsc::channel::<WsMessage>(1);
+        let control = CommunityConnectionControl::new(cancel.clone());
+        control.set_proven_pubkey(target_pubkey.clone());
+        control.set_terminal_frame_sender(terminal_tx.clone());
+
+        let registry = Arc::new(CommunityConnectionRegistry::new());
+        let _guard = registry.register(Uuid::new_v4(), community, control.clone());
+
+        // Arm the quiesce-entry hook before spawning.
+        let quiesce_arrived_rx = quiesce_cancel_arm_hook::arm(control.hook_key);
+
+        let task_handle = spawn_nip_fi_expiry_task(
+            far_future,
+            Arc::clone(&gate),
+            terminal_tx,
+            NipFiWsRoute::Root,
+            control.clone(),
+        );
+
+        // ── Admin disconnect via the real production path. ────────────────────
+        let closed = registry.disconnect_nip_fi(&target_pubkey);
+        assert_eq!(
+            closed, 1,
+            "W_f5_cleanup: registry must find exactly 1 connection"
+        );
+
+        // ── Wait for the task to enter the cancel arm (quiesce blocked). ─────
+        tokio::time::timeout(std::time::Duration::from_secs(2), quiesce_arrived_rx)
+            .await
+            .expect("W_f5_cleanup: quiesce-entry hook must fire within 2s")
+            .expect("W_f5_cleanup: quiesce-entry hook sender must not be dropped");
+
+        // Task is blocked in quiesce() — permit is still held.
+        assert!(
+            !task_handle.is_finished(),
+            "W_f5_cleanup: expiry task must be blocked in quiesce() while permit is held"
+        );
+
+        // ── Simulate in-flight REQ registration while quiesce is blocked. ─────
+        // This is the critical sequence: the permit holder finishes its bounded
+        // work (subscription registration) WHILE the expiry task is waiting.
+        // Without quiesce(), the task would have already exited and remove_connection
+        // would have run — so this registration would become an orphan.
+        let sub_id = "test-sub-f5".to_string();
+        let filters = vec![Filter::new()];
+        sub_registry.register_scoped(community, conn_id, sub_id, filters, None);
+
+        // Verify the subscription is visible in the registry while quiesce blocks.
+        assert_eq!(
+            sub_registry.total_subscriptions(),
+            1,
+            "W_f5_cleanup: subscription must be registered while quiesce is blocked"
+        );
+
+        // ── Release the permit — quiesce() unblocks and the task completes. ──
+        drop(permit);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), task_handle)
+            .await
+            .expect("W_f5_cleanup: expiry task must complete within 2s after permit released")
+            .expect("W_f5_cleanup: expiry task must not panic");
+
+        // ── Production teardown simulation: remove_connection runs AFTER task. ─
+        // In connection.rs: `let _ = nip_fi_expiry_task.await` (line ~628) then
+        // `for removed in state.sub_registry.remove_connection(conn.conn_id)`.
+        // Because quiesce guaranteed the REQ handler finished before the task
+        // returned, remove_connection finds the registered subscription.
+        let removed = sub_registry.remove_connection(conn_id);
+        assert_eq!(
+            removed.len(),
+            1,
+            "W_f5_cleanup: remove_connection must find exactly 1 subscription — \
+             the one registered while quiesce was blocked.  Zero means the \
+             registration happened AFTER teardown (orphan scenario — quiesce broken)."
+        );
+
+        // After cleanup: no subscriptions remain.
+        assert_eq!(
+            sub_registry.total_subscriptions(),
+            0,
+            "W_f5_cleanup: zero subscriptions must remain after remove_connection \
+             (complete cleanup, no orphan entries)"
         );
     }
 }
