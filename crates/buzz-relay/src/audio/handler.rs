@@ -240,10 +240,14 @@ pub(crate) async fn handle_active_audio_connection(
     let challenge = generate_challenge();
     let challenge_msg =
         serde_json::json!({"type": "challenge", "challenge": challenge}).to_string();
-    if ws_send
-        .send(WsMessage::Text(challenge_msg.into()))
-        .await
-        .is_err()
+    // Bounded send: pre-registration exits must not block on a stalled
+    // sink indefinitely. [R2: bounded delivery — consistent policy]
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        ws_send.send(WsMessage::Text(challenge_msg.into())),
+    )
+    .await
+    .is_err()
     {
         return;
     }
@@ -290,13 +294,17 @@ pub(crate) async fn handle_active_audio_connection(
         Ok(ctx) => ctx,
         Err(e) => {
             warn!(channel_id = %channel_id, "audio auth failed: {e}");
-            let _ = ws_send
-                .send(WsMessage::Text(
+            // Bounded send: pre-registration exits must not block on a stalled
+            // sink indefinitely. [R2: bounded delivery — consistent policy]
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                ws_send.send(WsMessage::Text(
                     serde_json::json!({"type":"error","message":"auth failed"})
                         .to_string()
                         .into(),
-                ))
-                .await;
+                )),
+            )
+            .await;
             return;
         }
     };
@@ -696,13 +704,17 @@ pub(crate) async fn handle_active_audio_connection(
         Ok(admission) => admission,
         Err(e) => {
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership denied: {e}");
-            let _ = ws_send
-                .send(WsMessage::Text(
+            // Bounded send: pre-writer exits must not block on a stalled
+            // sink indefinitely. [R2: bounded delivery — consistent policy]
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                ws_send.send(WsMessage::Text(
                     serde_json::json!({"type":"error","message":"not a member"})
                         .to_string()
                         .into(),
-                ))
-                .await;
+                )),
+            )
+            .await;
             // [R2: pre-writer invariant boundary]
             drain_terminal!(control, _nip_fi_admission_expiry);
             return;
@@ -741,8 +753,11 @@ pub(crate) async fn handle_active_audio_connection(
     match state.mesh() {
         Some(mesh) => {
             if mesh.owners.is_draining() {
-                let _ = ws_send
-                    .send(WsMessage::Text(
+                // Bounded send: pre-writer exits must not block on a stalled
+                // sink indefinitely. [R2: bounded delivery — consistent policy]
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    ws_send.send(WsMessage::Text(
                         serde_json::json!({
                             "type": "error",
                             "code": "huddle_relay_draining",
@@ -750,8 +765,9 @@ pub(crate) async fn handle_active_audio_connection(
                         })
                         .to_string()
                         .into(),
-                    ))
-                    .await;
+                    )),
+                )
+                .await;
                 // [R2: pre-writer invariant boundary]
                 drain_terminal!(control, _nip_fi_admission_expiry);
                 return;
@@ -779,8 +795,11 @@ pub(crate) async fn handle_active_audio_connection(
                         pubkey = %pubkey_hex,
                         "huddle join rejected by fence: {e}"
                     );
-                    let _ = ws_send
-                        .send(WsMessage::Text(
+                    // Bounded send: pre-writer exits must not block on a stalled
+                    // sink indefinitely. [R2: bounded delivery — consistent policy]
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        ws_send.send(WsMessage::Text(
                             serde_json::json!({
                                 "type": "error",
                                 "code": "join_rejected",
@@ -788,8 +807,9 @@ pub(crate) async fn handle_active_audio_connection(
                             })
                             .to_string()
                             .into(),
-                        ))
-                        .await;
+                        )),
+                    )
+                    .await;
                     // [R2: pre-writer invariant boundary]
                     drain_terminal!(control, _nip_fi_admission_expiry);
                     return;
@@ -806,8 +826,11 @@ pub(crate) async fn handle_active_audio_connection(
                     pubkey = %pubkey_hex,
                     "huddle audio unavailable under horizontal scaling — rejecting join"
                 );
-                let _ = ws_send
-                    .send(WsMessage::Text(
+                // Bounded send: pre-writer exits must not block on a stalled
+                // sink indefinitely. [R2: bounded delivery — consistent policy]
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    ws_send.send(WsMessage::Text(
                         serde_json::json!({
                             "type": "error",
                             "code": "huddle_audio_unavailable",
@@ -815,8 +838,9 @@ pub(crate) async fn handle_active_audio_connection(
                         })
                         .to_string()
                         .into(),
-                    ))
-                    .await;
+                    )),
+                )
+                .await;
                 // [R2: pre-writer invariant boundary]
                 drain_terminal!(control, _nip_fi_admission_expiry);
                 return;
@@ -842,13 +866,17 @@ pub(crate) async fn handle_active_audio_connection(
     match state.db.get_channel(tenant.community(), channel_id).await {
         Ok(ch) if ch.archived_at.is_some() => {
             debug!(channel_id = %channel_id, "channel archived before room join");
-            let _ = ws_send
-                .send(WsMessage::Text(
+            // Bounded send: pre-writer exits must not block on a stalled
+            // sink indefinitely. [R2: bounded delivery — consistent policy]
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                ws_send.send(WsMessage::Text(
                     serde_json::json!({"type":"error","message":"huddle has ended"})
                         .to_string()
                         .into(),
-                ))
-                .await;
+                )),
+            )
+            .await;
             // I1 residual: release lease with an awaited call, not a detached task.
             if let Some((lease, directory)) = staged_lease {
                 if let Err(e) = directory.release(&lease).await {
@@ -894,8 +922,11 @@ pub(crate) async fn handle_active_audio_connection(
             current = CURRENT_PROTOCOL_VERSION,
             "audio: client requested unsupported protocol version"
         );
-        let _ = ws_send
-            .send(WsMessage::Text(
+        // Bounded send: pre-writer exits must not block on a stalled
+        // sink indefinitely. [R2: bounded delivery — consistent policy]
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ws_send.send(WsMessage::Text(
                 serde_json::json!({
                     "type": "error",
                     "code": "unsupported_version",
@@ -906,8 +937,9 @@ pub(crate) async fn handle_active_audio_connection(
                 })
                 .to_string()
                 .into(),
-            ))
-            .await;
+            )),
+        )
+        .await;
         if let Some((lease, directory)) = staged_lease {
             // I1 residual: release lease with an awaited call, not a detached task.
             if let Err(e) = directory.release(&lease).await {
@@ -967,11 +999,15 @@ pub(crate) async fn handle_active_audio_connection(
             }
             Err(crate::audio::join::DialError::Rejected(reason)) => {
                 warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "huddle owner rejected registration: {reason:?}");
-                let _ = ws_send
-                    .send(WsMessage::Text(
+                // Bounded send: pre-writer exits must not block on a stalled
+                // sink indefinitely. [R2: bounded delivery — consistent policy]
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    ws_send.send(WsMessage::Text(
                         remote_rejection_ws_error(&reason).to_string().into(),
-                    ))
-                    .await;
+                    )),
+                )
+                .await;
                 // I3 residual: await expiry task before resource teardown.
                 // B2: lifecycle_cancel holds the transition lock so any concurrent
                 // terminal writer that won the reason but hasn't enqueued yet
@@ -992,16 +1028,20 @@ pub(crate) async fn handle_active_audio_connection(
             }
             Err(crate::audio::join::DialError::Mesh(e)) => {
                 warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "huddle owner registration failed: {e}");
-                let _ = ws_send
-                    .send(WsMessage::Text(
+                // Bounded send: pre-writer exits must not block on a stalled
+                // sink indefinitely. [R2: bounded delivery — consistent policy]
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    ws_send.send(WsMessage::Text(
                         serde_json::json!({
                             "type": "error", "code": "huddle_owner_unreachable",
                             "message": "could not reach the huddle owner"
                         })
                         .to_string()
                         .into(),
-                    ))
-                    .await;
+                    )),
+                )
+                .await;
                 // I3 residual: await expiry task before resource teardown.
                 // B2: lifecycle_cancel holds the transition lock so any concurrent
                 // terminal writer that won the reason but hasn't enqueued yet
