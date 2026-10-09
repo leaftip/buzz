@@ -81,6 +81,17 @@ enum Command {
     ListMembers,
     /// Generate a new Nostr keypair (for bootstrapping).
     GenerateKey,
+    /// Mint a NIP-OA owner attestation for an agent key: the `auth` tag JSON that goes into
+    /// the agent's BUZZ_AUTH_TAG. The owner signs with BUZZ_PRIVATE_KEY (nsec or hex) from
+    /// the environment; nothing is stored. The tag is verified before it is printed.
+    Attest {
+        /// The agent's public key — bech32 npub or 64-char hex.
+        #[arg(long)]
+        agent: String,
+        /// NIP-OA conditions, e.g. "kind=9&created_at>1700000000" (default: none).
+        #[arg(long, default_value = "")]
+        conditions: String,
+    },
     /// Run pending database migrations.
     Migrate,
     /// Compute one complete S3 storage snapshot and persist it for relay readers.
@@ -152,6 +163,26 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<i32> {
     match cli.command {
+        Command::Attest { agent, conditions } => {
+            let owner_hex = std::env::var("BUZZ_PRIVATE_KEY")
+                .map_err(|_| anyhow::anyhow!("BUZZ_PRIVATE_KEY (the owner's key) is required"))?;
+            let owner = Keys::parse(owner_hex.trim())
+                .map_err(|e| anyhow::anyhow!("invalid BUZZ_PRIVATE_KEY: {e}"))?;
+            let agent_pk = nostr::PublicKey::parse(agent.trim())
+                .map_err(|e| anyhow::anyhow!("invalid --agent: {e}"))?;
+            let tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent_pk, &conditions)
+                .map_err(|e| anyhow::anyhow!("attestation failed: {e}"))?;
+            let verified = buzz_sdk::nip_oa::verify_auth_tag(&tag, &agent_pk)
+                .map_err(|e| anyhow::anyhow!("the minted tag does not verify: {e}"))?;
+            eprintln!(
+                "Owner {} attests agent {} (conditions: {:?}); verified.",
+                verified.to_hex(),
+                agent_pk.to_hex(),
+                conditions
+            );
+            println!("{tag}");
+            Ok(0)
+        }
         Command::GenerateKey => {
             let keys = Keys::generate();
             println!("Public key:  {}", keys.public_key().to_hex());
